@@ -27,6 +27,35 @@ func (mr *MapReduce) KillWorkers() *list.List {
 }
 
 func (mr *MapReduce) RunMaster() *list.List {
-	// Your code here
+	waitingChannel := make(chan string)
+
+	workerDoJob := func(addr string, args *DoJobArgs) {
+		var reply DoJobReply
+		call(addr, "Worker.DoJob", args, &reply)
+		waitingChannel <- addr
+	}
+
+	for i := 0; i < mr.nMap; i++ {
+		args := &DoJobArgs{mr.file, Map, i, mr.nReduce}
+		select {
+		case addr := <-mr.registerChannel:
+			mr.Workers[addr] = &WorkerInfo{addr}
+			go workerDoJob(addr, args)
+		case addr := <-waitingChannel:
+			go workerDoJob(addr, args)
+		}
+	}
+
+	for i := 0; i < mr.nReduce; i++ {
+		args := &DoJobArgs{mr.file, Reduce, i, mr.nMap}
+		select {
+		case addr := <-mr.registerChannel:
+			mr.Workers[addr] = &WorkerInfo{addr}
+			go workerDoJob(addr, args)
+		case addr := <-waitingChannel:
+			go workerDoJob(addr, args)
+		}
+	}
+
 	return mr.KillWorkers()
 }
