@@ -8,21 +8,82 @@ import "sync"
 import "fmt"
 import "os"
 
+type serverInfo struct {
+	lastPing  time.Time
+	viewAcked uint
+}
+
 type ViewServer struct {
 	mu   sync.Mutex
 	l    net.Listener
 	dead bool
 	me   string
 
-	// Your declarations here.
+	curr          View
+	canUpdateView bool
+	servers       map[string]serverInfo
+}
+
+func (vs *ViewServer) updateView() {
+	if vs.curr.Primary == "" && len(vs.servers) > 0 {
+		var p string
+		for id := range vs.servers {
+			p = id
+			break
+		}
+		vs.curr = View{1, p, ""}
+		vs.canUpdateView = false
+		return
+	}
+
+	if !vs.canUpdateView {
+		return
+	}
+
+	if info, ok := vs.servers[vs.curr.Primary]; !ok || info.viewAcked == 0 {
+		p, b := vs.curr.Backup, ""
+		for id := range vs.servers {
+			if id != p {
+				b = id
+				break
+			}
+		}
+		vs.curr = View{vs.curr.Viewnum + 1, p, b}
+		vs.canUpdateView = false
+		return
+	}
+
+	if info, ok := vs.servers[vs.curr.Backup]; !ok || info.viewAcked == 0 {
+		p, b := vs.curr.Primary, ""
+		for id := range vs.servers {
+			if id != p {
+				b = id
+				break
+			}
+		}
+		vs.curr = View{vs.curr.Viewnum + 1, p, b}
+		return
+	}
 }
 
 //
 // server Ping RPC handler.
 //
 func (vs *ViewServer) Ping(args *PingArgs, reply *PingReply) error {
+	vs.mu.Lock()
+	defer vs.mu.Unlock()
 
-	// Your code here.
+	id, viewnum := args.Me, args.Viewnum
+
+	vs.servers[id] = serverInfo{time.Now(), viewnum}
+
+	if id == vs.curr.Primary && viewnum == vs.curr.Viewnum {
+		vs.canUpdateView = true
+	}
+
+	vs.updateView()
+
+	reply.View = vs.curr
 
 	return nil
 }
@@ -31,8 +92,10 @@ func (vs *ViewServer) Ping(args *PingArgs, reply *PingReply) error {
 // server Get() RPC handler.
 //
 func (vs *ViewServer) Get(args *GetArgs, reply *GetReply) error {
+	vs.mu.Lock()
+	defer vs.mu.Unlock()
 
-	// Your code here.
+	reply.View = vs.curr
 
 	return nil
 }
@@ -43,8 +106,22 @@ func (vs *ViewServer) Get(args *GetArgs, reply *GetReply) error {
 // accordingly.
 //
 func (vs *ViewServer) tick() {
+	vs.mu.Lock()
+	defer vs.mu.Unlock()
 
-	// Your code here.
+	dead := make([]string, 0)
+
+	for id, info := range vs.servers {
+		if time.Since(info.lastPing) >= DeadPings*PingInterval {
+			dead = append(dead, id)
+		}
+	}
+
+	for _, id := range dead {
+		delete(vs.servers, id)
+	}
+
+	vs.updateView()
 }
 
 //
@@ -60,7 +137,8 @@ func (vs *ViewServer) Kill() {
 func StartServer(me string) *ViewServer {
 	vs := new(ViewServer)
 	vs.me = me
-	// Your vs.* initializations here.
+	vs.canUpdateView = true
+	vs.servers = make(map[string]serverInfo)
 
 	// tell net/rpc about our RPC server and handlers.
 	rpcs := rpc.NewServer()
