@@ -64,12 +64,13 @@ func (vs *ViewServer) checkBackup() {
 		if b != "" {
 			vs.curr.Viewnum++
 			vs.curr.Backup = b
+			vs.canUpdateView = false
 		}
 		log.Printf("END 1 checkBackup %v %t", vs.curr, vs.canUpdateView)
 		return
 	}
 
-	if info, ok := vs.servers[b]; !ok || info.viewAcked == 0 {
+	if _, ok := vs.servers[b]; !ok {
 		p, b := vs.curr.Primary, ""
 		for id := range vs.servers {
 			if id != p {
@@ -79,6 +80,7 @@ func (vs *ViewServer) checkBackup() {
 		}
 		vs.curr.Viewnum++
 		vs.curr.Backup = b
+		vs.canUpdateView = false
 	}
 	log.Printf("END 2 checkBackup %v %t", vs.curr, vs.canUpdateView)
 }
@@ -88,14 +90,16 @@ func (vs *ViewServer) addServer(id string) {
 	if vs.curr.Primary == "" {
 		vs.curr = View{1, id, ""}
 		vs.canUpdateView = false
+		log.Printf("END addServer 1 %v %t", vs.curr, vs.canUpdateView)
 		return
 	}
 
 	if vs.curr.Backup == "" && vs.canUpdateView {
 		vs.curr.Viewnum++
 		vs.curr.Backup = id
+		vs.canUpdateView = false
 	}
-	log.Printf("END addServer %v %t", vs.curr, vs.canUpdateView)
+	log.Printf("END addServer 2 %v %t", vs.curr, vs.canUpdateView)
 }
 
 //
