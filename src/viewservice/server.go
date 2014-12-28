@@ -24,41 +24,36 @@ type ViewServer struct {
 	servers       map[string]serverInfo
 }
 
-func (vs *ViewServer) updateView() {
-	if vs.curr.Primary == "" {
-		if len(vs.servers) == 0 {
-			return
-		}
-		var p string
-		for id := range vs.servers {
-			p = id
-			break
-		}
-		vs.curr = View{1, p, ""}
-		vs.canUpdateView = false
-		log.Printf("%v %t", vs.curr, vs.canUpdateView)
-		return
-	}
-
+func (vs *ViewServer) checkPrimary() {
+	log.Printf("checkPrimary %v %t", vs.curr, vs.canUpdateView)
 	if !vs.canUpdateView {
 		return
 	}
 
-	if info, ok := vs.servers[vs.curr.Primary]; !ok || info.viewAcked == 0 {
-		p, b := vs.curr.Backup, ""
-		for id := range vs.servers {
-			if id != p {
-				b = id
-				break
-			}
+	p, b := vs.curr.Backup, ""
+
+	// select new backup
+	for id := range vs.servers {
+		if id != p {
+			b = id
+			break
 		}
-		vs.curr = View{vs.curr.Viewnum + 1, p, b}
-		vs.canUpdateView = false
-		log.Printf("%v %t", vs.curr, vs.canUpdateView)
+	}
+
+	vs.curr = View{vs.curr.Viewnum + 1, p, b}
+	vs.canUpdateView = false
+	log.Printf("END checkPrimary %v %t", vs.curr, vs.canUpdateView)
+}
+
+func (vs *ViewServer) checkBackup() {
+	log.Printf("checkBackup %v %t", vs.curr, vs.canUpdateView)
+	if !vs.canUpdateView {
 		return
 	}
 
-	if b := vs.curr.Backup; b == "" {
+	b := vs.curr.Backup
+
+	if b == "" {
 		p := vs.curr.Primary
 		for id := range vs.servers {
 			if id != p {
@@ -67,24 +62,40 @@ func (vs *ViewServer) updateView() {
 			}
 		}
 		if b != "" {
-			vs.curr = View{vs.curr.Viewnum + 1, p, b}
-			log.Printf("%v %t", vs.curr, vs.canUpdateView)
+			vs.curr.Viewnum++
+			vs.curr.Backup = b
 		}
+		log.Printf("END 1 checkBackup %v %t", vs.curr, vs.canUpdateView)
 		return
 	}
 
-	if info, ok := vs.servers[vs.curr.Backup]; !ok || info.viewAcked == 0 {
-		p,b := vs.curr.Primary, ""
+	if info, ok := vs.servers[b]; !ok || info.viewAcked == 0 {
+		p, b := vs.curr.Primary, ""
 		for id := range vs.servers {
 			if id != p {
 				b = id
 				break
 			}
 		}
-		vs.curr = View{vs.curr.Viewnum + 1, p, b}
-		log.Printf("%v %t", vs.curr, vs.canUpdateView)
+		vs.curr.Viewnum++
+		vs.curr.Backup = b
+	}
+	log.Printf("END 2 checkBackup %v %t", vs.curr, vs.canUpdateView)
+}
+
+func (vs *ViewServer) addServer(id string) {
+	log.Printf("addServer %v %t", vs.curr, vs.canUpdateView)
+	if vs.curr.Primary == "" {
+		vs.curr = View{1, id, ""}
+		vs.canUpdateView = false
 		return
 	}
+
+	if vs.curr.Backup == "" && vs.canUpdateView {
+		vs.curr.Viewnum++
+		vs.curr.Backup = id
+	}
+	log.Printf("END addServer %v %t", vs.curr, vs.canUpdateView)
 }
 
 //
@@ -96,13 +107,25 @@ func (vs *ViewServer) Ping(args *PingArgs, reply *PingReply) error {
 
 	id, viewnum := args.Me, args.Viewnum
 
+	log.Printf("Ping %s %d", id, viewnum)
+
 	vs.servers[id] = serverInfo{time.Now(), viewnum}
 
 	if id == vs.curr.Primary && viewnum == vs.curr.Viewnum {
 		vs.canUpdateView = true
+		vs.checkBackup()
 	}
 
-	vs.updateView()
+	if viewnum == 0 {
+		switch id {
+		case vs.curr.Primary:
+			vs.checkPrimary()
+		case vs.curr.Backup:
+			vs.checkBackup()
+		default:
+			vs.addServer(id)
+		}
+	}
 
 	reply.View = vs.curr
 
@@ -130,6 +153,7 @@ func (vs *ViewServer) tick() {
 	vs.mu.Lock()
 	defer vs.mu.Unlock()
 
+	log.Printf("TICK!")
 	dead := make([]string, 0)
 
 	for id, info := range vs.servers {
@@ -142,7 +166,17 @@ func (vs *ViewServer) tick() {
 		delete(vs.servers, id)
 	}
 
-	vs.updateView()
+	if vs.curr.Primary != "" {
+		if _, ok := vs.servers[vs.curr.Primary]; !ok {
+			vs.checkPrimary()
+		}
+	}
+
+	if vs.curr.Backup != "" {
+		if _, ok := vs.servers[vs.curr.Backup]; !ok {
+			vs.checkBackup()
+		}
+	}
 }
 
 //
