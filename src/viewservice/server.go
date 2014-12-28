@@ -25,7 +25,10 @@ type ViewServer struct {
 }
 
 func (vs *ViewServer) updateView() {
-	if vs.curr.Primary == "" && len(vs.servers) > 0 {
+	if vs.curr.Primary == "" {
+		if len(vs.servers) == 0 {
+			return
+		}
 		var p string
 		for id := range vs.servers {
 			p = id
@@ -33,6 +36,7 @@ func (vs *ViewServer) updateView() {
 		}
 		vs.curr = View{1, p, ""}
 		vs.canUpdateView = false
+		log.Printf("%v %t", vs.curr, vs.canUpdateView)
 		return
 	}
 
@@ -50,11 +54,27 @@ func (vs *ViewServer) updateView() {
 		}
 		vs.curr = View{vs.curr.Viewnum + 1, p, b}
 		vs.canUpdateView = false
+		log.Printf("%v %t", vs.curr, vs.canUpdateView)
+		return
+	}
+
+	if b := vs.curr.Backup; b == "" {
+		p := vs.curr.Primary
+		for id := range vs.servers {
+			if id != p {
+				b = id
+				break
+			}
+		}
+		if b != "" {
+			vs.curr = View{vs.curr.Viewnum + 1, p, b}
+			log.Printf("%v %t", vs.curr, vs.canUpdateView)
+		}
 		return
 	}
 
 	if info, ok := vs.servers[vs.curr.Backup]; !ok || info.viewAcked == 0 {
-		p, b := vs.curr.Primary, ""
+		p,b := vs.curr.Primary, ""
 		for id := range vs.servers {
 			if id != p {
 				b = id
@@ -62,6 +82,7 @@ func (vs *ViewServer) updateView() {
 			}
 		}
 		vs.curr = View{vs.curr.Viewnum + 1, p, b}
+		log.Printf("%v %t", vs.curr, vs.canUpdateView)
 		return
 	}
 }
