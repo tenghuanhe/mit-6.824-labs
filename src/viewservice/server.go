@@ -8,98 +8,62 @@ import "sync"
 import "fmt"
 import "os"
 
-type serverInfo struct {
-	lastPing  time.Time
-	viewAcked uint
-}
-
 type ViewServer struct {
 	mu   sync.Mutex
 	l    net.Listener
 	dead bool
 	me   string
 
-	curr          View
-	canUpdateView bool
-	servers       map[string]serverInfo
+	curr            View
+	hasPrimaryAcked bool
+	lastSeen        map[string]time.Time
 }
 
-func (vs *ViewServer) checkPrimary() {
-	log.Printf("checkPrimary %v %t", vs.curr, vs.canUpdateView)
-	if !vs.canUpdateView {
-		return
-	}
-
-	p, b := vs.curr.Backup, ""
-
-	// select new backup
-	for id := range vs.servers {
-		if id != p {
-			b = id
-			break
-		}
-	}
-
-	vs.curr = View{vs.curr.Viewnum + 1, p, b}
-	vs.canUpdateView = false
-	log.Printf("END checkPrimary %v %t", vs.curr, vs.canUpdateView)
+func (vs *ViewServer) changeView(n uint, p, b string) {
+	vs.curr = View{n, p, b}
+	vs.hasPrimaryAcked = false
 }
 
-func (vs *ViewServer) checkBackup() {
-	log.Printf("checkBackup %v %t", vs.curr, vs.canUpdateView)
-	if !vs.canUpdateView {
-		return
+func (vs *ViewServer) promoteBackup() bool {
+	if !vs.hasPrimaryAcked {
+		return false
 	}
 
-	b := vs.curr.Backup
-
-	if b == "" {
-		p := vs.curr.Primary
-		for id := range vs.servers {
-			if id != p {
-				b = id
-				break
-			}
-		}
-		if b != "" {
-			vs.curr.Viewnum++
-			vs.curr.Backup = b
-			vs.canUpdateView = false
-		}
-		log.Printf("END 1 checkBackup %v %t", vs.curr, vs.canUpdateView)
-		return
+	if vs.curr.Backup == "" {
+		log.Fatalln("Cannot replace primary. There is NO BACKUP!")
 	}
 
-	if _, ok := vs.servers[b]; !ok {
-		p, b := vs.curr.Primary, ""
-		for id := range vs.servers {
-			if id != p {
-				b = id
-				break
-			}
-		}
-		vs.curr.Viewnum++
-		vs.curr.Backup = b
-		vs.canUpdateView = false
-	}
-	log.Printf("END 2 checkBackup %v %t", vs.curr, vs.canUpdateView)
+	vs.changeView(vs.curr.Viewnum+1, vs.curr.Backup, "")
+
+	return true
 }
 
-func (vs *ViewServer) addServer(id string) {
-	log.Printf("addServer %v %t", vs.curr, vs.canUpdateView)
+func (vs *ViewServer) removeBackup() bool {
+	if !vs.hasPrimaryAcked {
+		return false
+	}
+
+	vs.changeView(vs.curr.Viewnum+1, vs.curr.Primary, "")
+
+	return true
+}
+
+func (vs *ViewServer) addServer(id string) bool {
+	if !vs.hasPrimaryAcked {
+		return false
+	}
+
 	if vs.curr.Primary == "" {
-		vs.curr = View{1, id, ""}
-		vs.canUpdateView = false
-		log.Printf("END addServer 1 %v %t", vs.curr, vs.canUpdateView)
-		return
+		vs.changeView(1, id, "")
+		return true
 	}
 
-	if vs.curr.Backup == "" && vs.canUpdateView {
-		vs.curr.Viewnum++
-		vs.curr.Backup = id
-		vs.canUpdateView = false
+	if vs.curr.Backup == "" {
+		vs.changeView(vs.curr.Viewnum+1, vs.curr.Primary, id)
+		return true
 	}
-	log.Printf("END addServer 2 %v %t", vs.curr, vs.canUpdateView)
+
+	return false
 }
 
 //
@@ -111,24 +75,22 @@ func (vs *ViewServer) Ping(args *PingArgs, reply *PingReply) error {
 
 	id, viewnum := args.Me, args.Viewnum
 
-	log.Printf("Ping %s %d", id, viewnum)
-
-	vs.servers[id] = serverInfo{time.Now(), viewnum}
-
-	if id == vs.curr.Primary && viewnum == vs.curr.Viewnum {
-		vs.canUpdateView = true
-		vs.checkBackup()
-	}
-
-	if viewnum == 0 {
-		switch id {
-		case vs.curr.Primary:
-			vs.checkPrimary()
-		case vs.curr.Backup:
-			vs.checkBackup()
-		default:
-			vs.addServer(id)
+	switch id {
+	case vs.curr.Primary:
+		if viewnum == vs.curr.Viewnum {
+			vs.hasPrimaryAcked = true
+			vs.lastSeen[vs.curr.Primary] = time.Now()
+		} else {
+			vs.promoteBackup()
 		}
+	case vs.curr.Backup:
+		if viewnum == vs.curr.Viewnum {
+			vs.lastSeen[vs.curr.Backup] = time.Now()
+		} else {
+			vs.removeBackup()
+		}
+	default:
+		vs.addServer(id)
 	}
 
 	reply.View = vs.curr
@@ -157,28 +119,14 @@ func (vs *ViewServer) tick() {
 	vs.mu.Lock()
 	defer vs.mu.Unlock()
 
-	log.Printf("TICK!")
-	dead := make([]string, 0)
-
-	for id, info := range vs.servers {
-		if time.Since(info.lastPing) >= DeadPings*PingInterval {
-			dead = append(dead, id)
-		}
-	}
-
-	for _, id := range dead {
-		delete(vs.servers, id)
-	}
-
-	if vs.curr.Primary != "" {
-		if _, ok := vs.servers[vs.curr.Primary]; !ok {
-			vs.checkPrimary()
-		}
-	}
-
-	if vs.curr.Backup != "" {
-		if _, ok := vs.servers[vs.curr.Backup]; !ok {
-			vs.checkBackup()
+	for id, t := range vs.lastSeen {
+		if time.Since(t) >= DeadPings*PingInterval {
+			switch id {
+			case vs.curr.Primary:
+				vs.promoteBackup()
+			case vs.curr.Backup:
+				vs.removeBackup()
+			}
 		}
 	}
 }
@@ -196,8 +144,8 @@ func (vs *ViewServer) Kill() {
 func StartServer(me string) *ViewServer {
 	vs := new(ViewServer)
 	vs.me = me
-	vs.canUpdateView = true
-	vs.servers = make(map[string]serverInfo)
+	vs.hasPrimaryAcked = true
+	vs.lastSeen = make(map[string]time.Time)
 
 	// tell net/rpc about our RPC server and handlers.
 	rpcs := rpc.NewServer()
