@@ -35,7 +35,11 @@ type GetReply struct {
 	Value string
 }
 
-// Your RPC definitions here.
+type SyncArgs struct {
+	Data map[string]string
+}
+
+type SyncReply struct{}
 
 func hash(s string) uint32 {
 	h := fnv.New32a()

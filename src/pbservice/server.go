@@ -11,7 +11,7 @@ import "syscall"
 import "math/rand"
 import "sync"
 
-//import "strconv"
+import "strconv"
 
 // Debugging
 const Debug = 0
@@ -24,6 +24,7 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 }
 
 type PBServer struct {
+	mu         sync.RWMutex
 	l          net.Listener
 	dead       bool // for testing
 	unreliable bool // for testing
@@ -31,22 +32,137 @@ type PBServer struct {
 	vs         *viewservice.Clerk
 	done       sync.WaitGroup
 	finish     chan interface{}
-	// Your declarations here.
+	curr       viewservice.View
+	data       map[string]string
+}
+
+func (pb *PBServer) put(args *PutArgs, reply *PutReply) {
+	if args.DoHash {
+		prevValue := pb.data[args.Key]
+		args.Value = strconv.Itoa(int(hash(prevValue + args.Value)))
+		reply.PreviousValue = prevValue
+	}
+
+	pb.data[args.Key] = args.Value
+
+	reply.Err = OK
 }
 
 func (pb *PBServer) Put(args *PutArgs, reply *PutReply) error {
-	// Your code here.
+	pb.mu.Lock()
+	defer pb.mu.Unlock()
+
+	if pb.me != pb.curr.Primary {
+		reply.Err = ErrWrongServer
+		return nil
+	}
+
+	if pb.curr.Backup != "" {
+		if ok := call(pb.curr.Backup, "PBServer.BPut", args, reply); !ok {
+			return fmt.Errorf("Put [%s]: Error talking to backup [%s]", pb.curr.Primary, pb.curr.Backup)
+		}
+
+		if reply.Err != OK {
+			return nil
+		}
+	}
+
+	pb.put(args,reply)
+
 	return nil
 }
 
+func (pb *PBServer) BPut(args *PutArgs, reply *PutReply) error {
+	pb.mu.Lock()
+	defer pb.mu.Unlock()
+
+	if pb.me != pb.curr.Backup {
+		reply.Err = ErrWrongServer
+		return nil
+	}
+
+	pb.put(args,reply)
+
+	return nil
+}
+
+func (pb *PBServer) get(args *GetArgs, reply *GetReply) {
+	if _, ok := pb.data[args.Key]; !ok {
+		reply.Err = ErrNoKey
+		return
+	}
+
+	reply.Err = OK
+	reply.Value = pb.data[args.Key]
+}
+
 func (pb *PBServer) Get(args *GetArgs, reply *GetReply) error {
-	// Your code here.
+	pb.mu.RLock()
+	defer pb.mu.RUnlock()
+
+	if pb.me != pb.curr.Primary {
+		reply.Err = ErrWrongServer
+		return nil
+	}
+
+	if pb.curr.Backup != "" {
+		if ok := call(pb.curr.Backup, "PBServer.BGet", args, reply); !ok {
+			return fmt.Errorf("Get [%s]: Error talking to backup [%s]", pb.curr.Primary, pb.curr.Backup)
+		}
+
+		if reply.Err != OK {
+			return nil
+		}
+	}
+
+	pb.get(args, reply)
+
+	return nil
+}
+
+func (pb *PBServer) BGet(args *GetArgs, reply *GetReply) error {
+	pb.mu.RLock()
+	defer pb.mu.RUnlock()
+
+	if pb.me != pb.curr.Backup {
+		reply.Err = ErrWrongServer
+		return nil
+	}
+
+	pb.get(args, reply)
+
+	return nil
+}
+
+func (pb *PBServer) BSync(args *SyncArgs, reply *SyncReply) error {
+	pb.mu.Lock()
+	defer pb.mu.Unlock()
+
+	pb.data = args.Data
+
 	return nil
 }
 
 // ping the viewserver periodically.
 func (pb *PBServer) tick() {
-	// Your code here.
+	pb.mu.Lock()
+	defer pb.mu.Unlock()
+
+	view, err := pb.vs.Ping(pb.curr.Viewnum)
+
+	if err != nil {
+		return
+	}
+
+	if view.Primary == pb.me && view.Backup != "" && view.Backup != pb.curr.Backup {
+		var reply SyncReply
+		if ok := call(view.Backup, "PBServer.BSync", SyncArgs{Data: pb.data}, &reply); !ok {
+			log.Printf("Sync [%s]: Error talking to backup [%s]", view.Primary, view.Backup)
+			return
+		}
+	}
+
+	pb.curr = view
 }
 
 // tell the server to shut itself down.
@@ -61,7 +177,8 @@ func StartServer(vshost string, me string) *PBServer {
 	pb.me = me
 	pb.vs = viewservice.MakeClerk(me, vshost)
 	pb.finish = make(chan interface{})
-	// Your pb.* initializations here.
+
+	pb.data = make(map[string]string)
 
 	rpcs := rpc.NewServer()
 	rpcs.Register(pb)
