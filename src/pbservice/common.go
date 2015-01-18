@@ -34,7 +34,7 @@ type GetReply struct {
 
 type SyncArgs struct {
 	Data    map[string]string
-	Replies map[int64]interface{}
+	Replies map[int64]string
 }
 
 type SyncReply struct{}

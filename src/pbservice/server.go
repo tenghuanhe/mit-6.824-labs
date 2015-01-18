@@ -34,7 +34,7 @@ type PBServer struct {
 	finish     chan interface{}
 	curr       viewservice.View
 	data       map[string]string
-	replies    map[int64]interface{}
+	replies    map[int64]string
 }
 
 func (pb *PBServer) put(args *PutArgs, reply *PutReply) {
@@ -54,7 +54,8 @@ func (pb *PBServer) Put(args *PutArgs, reply *PutReply) error {
 	defer pb.mu.Unlock()
 
 	if r, ok := pb.replies[args.Xid]; ok {
-		*reply = r.(PutReply)
+		reply.Err = OK
+		reply.PreviousValue = r
 		return nil
 	}
 
@@ -75,7 +76,7 @@ func (pb *PBServer) Put(args *PutArgs, reply *PutReply) error {
 
 	pb.put(args, reply)
 
-	pb.replies[args.Xid] = *reply
+	pb.replies[args.Xid] = reply.PreviousValue
 
 	return nil
 }
@@ -91,7 +92,7 @@ func (pb *PBServer) BPut(args *PutArgs, reply *PutReply) error {
 
 	pb.put(args, reply)
 
-	pb.replies[args.Xid] = *reply
+	pb.replies[args.Xid] = reply.PreviousValue
 
 	return nil
 }
@@ -111,7 +112,8 @@ func (pb *PBServer) Get(args *GetArgs, reply *GetReply) error {
 	defer pb.mu.Unlock()
 
 	if r, ok := pb.replies[args.Xid]; ok {
-		*reply = r.(GetReply)
+		reply.Err = OK
+		reply.Value = r
 		return nil
 	}
 
@@ -132,7 +134,7 @@ func (pb *PBServer) Get(args *GetArgs, reply *GetReply) error {
 
 	pb.get(args, reply)
 
-	pb.replies[args.Xid] = *reply
+	pb.replies[args.Xid] = reply.Value
 
 	return nil
 }
@@ -148,7 +150,7 @@ func (pb *PBServer) BGet(args *GetArgs, reply *GetReply) error {
 
 	pb.get(args, reply)
 
-	pb.replies[args.Xid] = *reply
+	pb.replies[args.Xid] = reply.Value
 
 	return nil
 }
@@ -198,7 +200,7 @@ func StartServer(vshost string, me string) *PBServer {
 	pb.vs = viewservice.MakeClerk(me, vshost)
 	pb.finish = make(chan interface{})
 	pb.data = make(map[string]string)
-	pb.replies = make(map[int64]interface{})
+	pb.replies = make(map[int64]string)
 
 	rpcs := rpc.NewServer()
 	rpcs.Register(pb)
