@@ -30,7 +30,7 @@ func (vs *ViewServer) promoteBackup() bool {
 	}
 
 	if vs.curr.Backup == "" {
-		log.Fatalln("Cannot replace primary. There is NO BACKUP!")
+		return false
 	}
 
 	vs.changeView(vs.curr.Viewnum+1, vs.curr.Backup, "")
