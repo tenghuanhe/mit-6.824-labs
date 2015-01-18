@@ -5,7 +5,8 @@ import "net/rpc"
 import "fmt"
 
 // You'll probably need to uncomment these:
-// import "time"
+import "time"
+
 // import "crypto/rand"
 // import "math/big"
 
@@ -63,10 +64,35 @@ func call(srv string, rpcname string,
 // says the key doesn't exist (has never been Put().
 //
 func (ck *Clerk) Get(key string) string {
+	p := ck.vs.Primary()
 
-	// Your code here.
+	for {
+		for p == "" {
+			time.Sleep(viewservice.PingInterval)
+			p = ck.vs.Primary()
+		}
 
-	return "???"
+		args := &GetArgs{key}
+		var reply GetReply
+
+		for i := 0; i < viewservice.DeadPings; i++ {
+			if ok := call(p, "PBServer.Get", args, &reply); ok {
+				break
+			}
+			time.Sleep(viewservice.PingInterval)
+		}
+
+		if reply.Err == "" || reply.Err == ErrWrongServer {
+			p = ""
+			continue
+		}
+
+		if reply.Err == ErrNoKey {
+			return ""
+		}
+
+		return reply.Value
+	}
 }
 
 //
@@ -74,9 +100,31 @@ func (ck *Clerk) Get(key string) string {
 // must keep trying until it succeeds.
 //
 func (ck *Clerk) PutExt(key string, value string, dohash bool) string {
+	p := ck.vs.Primary()
 
-	// Your code here.
-	return "???"
+	for {
+		for p == "" {
+			time.Sleep(viewservice.PingInterval)
+			p = ck.vs.Primary()
+		}
+
+		args := &PutArgs{key, value, dohash}
+		var reply PutReply
+
+		for i := 0; i < viewservice.DeadPings; i++ {
+			if ok := call(p, "PBServer.Put", args, &reply); ok {
+				break
+			}
+			time.Sleep(viewservice.PingInterval)
+		}
+
+		if reply.Err == "" || reply.Err == ErrWrongServer {
+			p = ""
+			continue
+		}
+
+		return reply.PreviousValue
+	}
 }
 
 func (ck *Clerk) Put(key string, value string) {

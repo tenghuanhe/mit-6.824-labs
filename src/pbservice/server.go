@@ -67,7 +67,7 @@ func (pb *PBServer) Put(args *PutArgs, reply *PutReply) error {
 		}
 	}
 
-	pb.put(args,reply)
+	pb.put(args, reply)
 
 	return nil
 }
@@ -81,7 +81,7 @@ func (pb *PBServer) BPut(args *PutArgs, reply *PutReply) error {
 		return nil
 	}
 
-	pb.put(args,reply)
+	pb.put(args, reply)
 
 	return nil
 }
