@@ -3,22 +3,17 @@ package pbservice
 import "viewservice"
 import "net/rpc"
 import "fmt"
-
-// You'll probably need to uncomment these:
 import "time"
-
-// import "crypto/rand"
-// import "math/big"
+import "crypto/rand"
+import "math/big"
 
 type Clerk struct {
 	vs *viewservice.Clerk
-	// Your declarations here
 }
 
 func MakeClerk(vshost string, me string) *Clerk {
 	ck := new(Clerk)
 	ck.vs = viewservice.MakeClerk(me, vshost)
-	// Your ck.* initializations here
 
 	return ck
 }
@@ -56,6 +51,13 @@ func call(srv string, rpcname string,
 	return false
 }
 
+func nrand() int64 {
+	max := big.NewInt(int64(1) << 62)
+	bigx, _ := rand.Int(rand.Reader, max)
+	x := bigx.Int64()
+	return x
+}
+
 //
 // fetch a key's value from the current primary;
 // if they key has never been set, return "".
@@ -65,6 +67,7 @@ func call(srv string, rpcname string,
 //
 func (ck *Clerk) Get(key string) string {
 	p := ck.vs.Primary()
+	xid := nrand()
 
 	for {
 		for p == "" {
@@ -72,7 +75,7 @@ func (ck *Clerk) Get(key string) string {
 			p = ck.vs.Primary()
 		}
 
-		args := &GetArgs{key}
+		args := &GetArgs{xid, key}
 		var reply GetReply
 
 		for i := 0; i < viewservice.DeadPings; i++ {
@@ -101,6 +104,7 @@ func (ck *Clerk) Get(key string) string {
 //
 func (ck *Clerk) PutExt(key string, value string, dohash bool) string {
 	p := ck.vs.Primary()
+	xid := nrand()
 
 	for {
 		for p == "" {
@@ -108,7 +112,7 @@ func (ck *Clerk) PutExt(key string, value string, dohash bool) string {
 			p = ck.vs.Primary()
 		}
 
-		args := &PutArgs{key, value, dohash}
+		args := &PutArgs{xid, key, value, dohash}
 		var reply PutReply
 
 		for i := 0; i < viewservice.DeadPings; i++ {

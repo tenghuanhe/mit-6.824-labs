@@ -24,7 +24,7 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 }
 
 type PBServer struct {
-	mu         sync.RWMutex
+	mu         sync.Mutex
 	l          net.Listener
 	dead       bool // for testing
 	unreliable bool // for testing
@@ -34,6 +34,7 @@ type PBServer struct {
 	finish     chan interface{}
 	curr       viewservice.View
 	data       map[string]string
+	replies    map[int64]interface{}
 }
 
 func (pb *PBServer) put(args *PutArgs, reply *PutReply) {
@@ -52,6 +53,11 @@ func (pb *PBServer) Put(args *PutArgs, reply *PutReply) error {
 	pb.mu.Lock()
 	defer pb.mu.Unlock()
 
+	if r, ok := pb.replies[args.Xid]; ok {
+		*reply = r.(PutReply)
+		return nil
+	}
+
 	if pb.me != pb.curr.Primary {
 		reply.Err = ErrWrongServer
 		return nil
@@ -69,6 +75,8 @@ func (pb *PBServer) Put(args *PutArgs, reply *PutReply) error {
 
 	pb.put(args, reply)
 
+	pb.replies[args.Xid] = *reply
+
 	return nil
 }
 
@@ -82,6 +90,8 @@ func (pb *PBServer) BPut(args *PutArgs, reply *PutReply) error {
 	}
 
 	pb.put(args, reply)
+
+	pb.replies[args.Xid] = *reply
 
 	return nil
 }
@@ -97,8 +107,13 @@ func (pb *PBServer) get(args *GetArgs, reply *GetReply) {
 }
 
 func (pb *PBServer) Get(args *GetArgs, reply *GetReply) error {
-	pb.mu.RLock()
-	defer pb.mu.RUnlock()
+	pb.mu.Lock()
+	defer pb.mu.Unlock()
+
+	if r, ok := pb.replies[args.Xid]; ok {
+		*reply = r.(GetReply)
+		return nil
+	}
 
 	if pb.me != pb.curr.Primary {
 		reply.Err = ErrWrongServer
@@ -117,12 +132,14 @@ func (pb *PBServer) Get(args *GetArgs, reply *GetReply) error {
 
 	pb.get(args, reply)
 
+	pb.replies[args.Xid] = *reply
+
 	return nil
 }
 
 func (pb *PBServer) BGet(args *GetArgs, reply *GetReply) error {
-	pb.mu.RLock()
-	defer pb.mu.RUnlock()
+	pb.mu.Lock()
+	defer pb.mu.Unlock()
 
 	if pb.me != pb.curr.Backup {
 		reply.Err = ErrWrongServer
@@ -130,6 +147,8 @@ func (pb *PBServer) BGet(args *GetArgs, reply *GetReply) error {
 	}
 
 	pb.get(args, reply)
+
+	pb.replies[args.Xid] = *reply
 
 	return nil
 }
@@ -139,6 +158,7 @@ func (pb *PBServer) BSync(args *SyncArgs, reply *SyncReply) error {
 	defer pb.mu.Unlock()
 
 	pb.data = args.Data
+	pb.replies = args.Replies
 
 	return nil
 }
@@ -156,7 +176,7 @@ func (pb *PBServer) tick() {
 
 	if view.Primary == pb.me && view.Backup != "" && view.Backup != pb.curr.Backup {
 		var reply SyncReply
-		if ok := call(view.Backup, "PBServer.BSync", SyncArgs{Data: pb.data}, &reply); !ok {
+		if ok := call(view.Backup, "PBServer.BSync", SyncArgs{pb.data, pb.replies}, &reply); !ok {
 			log.Printf("Sync [%s]: Error talking to backup [%s]", view.Primary, view.Backup)
 			return
 		}
@@ -177,8 +197,8 @@ func StartServer(vshost string, me string) *PBServer {
 	pb.me = me
 	pb.vs = viewservice.MakeClerk(me, vshost)
 	pb.finish = make(chan interface{})
-
 	pb.data = make(map[string]string)
+	pb.replies = make(map[int64]interface{})
 
 	rpcs := rpc.NewServer()
 	rpcs.Register(pb)
