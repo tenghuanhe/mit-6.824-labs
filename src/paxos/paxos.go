@@ -28,6 +28,7 @@ import "syscall"
 import "sync"
 import "fmt"
 import "math/rand"
+import "time"
 
 type Paxos struct {
 	mu         sync.Mutex
@@ -37,9 +38,34 @@ type Paxos struct {
 	rpcCount   int
 	peers      []string
 	me         int // index into peers[]
-
-	// Your data here.
+	log        []LogElement
 }
+
+type LogElement struct {
+	np        int
+	na        int
+	va        interface{}
+	isDecided bool
+}
+
+type PrepareArgs struct {
+	Seq int
+	N   int
+}
+
+type PrepareReply struct {
+	Np int
+	Na int
+	Va interface{}
+}
+
+type AcceptArgs struct {
+	Seq int
+	N   int
+	V   interface{}
+}
+
+type AcceptReply int
 
 //
 // call() sends an RPC to the rpcname handler on server srv
@@ -77,6 +103,203 @@ func call(srv string, name string, args interface{}, reply interface{}) bool {
 	return false
 }
 
+func (px *Paxos) ensureLogElementExists(seq int) bool {
+	if seq < len(px.log) {
+		return true
+	}
+
+	if seq < cap(px.log) {
+		px.log = px.log[0:cap(px.log)]
+		return true
+	}
+
+	for seq >= cap(px.log) {
+		px.log = px.log[0:cap(px.log)]
+		px.log = append(px.log, LogElement{})
+	}
+
+	return true
+}
+
+func (px *Paxos) Prepare(args *PrepareArgs, reply *PrepareReply) error {
+	log.Printf("Prepare<- [%d] [%d] [%d]\n", px.me, args.Seq, args.N)
+
+	px.mu.Lock()
+	defer px.mu.Unlock()
+
+	px.ensureLogElementExists(args.Seq)
+
+	elem := &px.log[args.Seq]
+
+	if args.N > elem.np {
+		elem.np = args.N
+	}
+
+	reply.Np = elem.np
+	reply.Na = elem.na
+	reply.Va = elem.va
+
+	log.Printf("<-Prepare [%d] [%d] [%d] [%v]\n", px.me, reply.Np, reply.Na, reply.Va)
+
+	return nil
+}
+
+func (px *Paxos) Accept(args *AcceptArgs, reply *AcceptReply) error {
+	log.Printf("Accept<- [%d] [%d] [%d] [%v]\n", px.me, args.Seq, args.N, args.V)
+
+	px.mu.Lock()
+	defer px.mu.Unlock()
+
+	px.ensureLogElementExists(args.Seq)
+
+	elem := &px.log[args.Seq]
+
+	if args.N >= elem.np {
+		elem.np = args.N
+		elem.na = args.N
+		elem.va = args.V
+	}
+
+	*reply = AcceptReply(elem.np)
+
+	log.Printf("<-Accept [%d] [%d]\n", px.me, int(*reply))
+
+	return nil
+}
+
+func (px *Paxos) broadcastPrepare(seq, n int) (v interface{}, ok bool) {
+	args := PrepareArgs{Seq: seq, N: n}
+
+	type PrepareChanResponse struct {
+		ok    bool
+		reply PrepareReply
+	}
+
+	prepareReplies := make(chan PrepareChanResponse)
+
+	for i, p := range px.peers {
+		go func(i int, p string) {
+			var ok bool
+			var reply PrepareReply
+			if i == px.me {
+				if err := px.Prepare(&args, &reply); err == nil {
+					ok = true
+				} else {
+					ok = false
+				}
+			} else {
+				ok = call(p, "Paxos.Prepare", args, &reply)
+			}
+			prepareReplies <- PrepareChanResponse{ok, reply}
+		}(i, p)
+	}
+
+	maxProposal := n
+	recdCount := 0
+
+	for _ = range px.peers {
+		response := <-prepareReplies
+		if response.ok {
+			recdCount++
+			reply := response.reply
+			if reply.Na > maxProposal {
+				maxProposal = reply.Na
+				v = reply.Va
+			}
+			if recdCount > len(px.peers)/2 {
+				break
+			}
+		}
+	}
+
+	if recdCount < len(px.peers)/2 {
+		return nil, false
+	}
+
+	return v, true
+}
+
+func (px *Paxos) broadcastAccept(seq, n int, v interface{}) (maxProposal int, ok bool) {
+	args := AcceptArgs{Seq: seq, N: n, V: v}
+
+	type AcceptChanResponse struct {
+		ok    bool
+		reply AcceptReply
+	}
+
+	acceptReplies := make(chan AcceptChanResponse)
+
+	for i, p := range px.peers {
+		go func(i int, p string) {
+			var ok bool
+			var reply AcceptReply
+			if i == px.me {
+				if err := px.Accept(&args, &reply); err == nil {
+					ok = true
+				} else {
+					ok = false
+				}
+			} else {
+				ok = call(p, "Paxos.Accept", args, &reply)
+			}
+			acceptReplies <- AcceptChanResponse{ok, reply}
+		}(i, p)
+	}
+
+	maxProposal = n
+	recdCount := 0
+
+	for _ = range px.peers {
+		response := <-acceptReplies
+		if response.ok {
+			recdCount++
+			reply := response.reply
+			if int(reply) > maxProposal {
+				maxProposal = int(reply)
+			}
+			if recdCount > len(px.peers)/2 {
+				break
+			}
+		}
+	}
+
+	if recdCount < len(px.peers)/2 || maxProposal > n {
+		return maxProposal, false
+	}
+
+	return n, true
+}
+
+func (px *Paxos) propose(seq, maxProposal int, v interface{}) {
+	log.Printf("propose [%d] [%d] [%d] [%v]\n", px.me, seq, maxProposal, v)
+
+	n := (((maxProposal >> 3) + 1) << 3) + px.me
+
+	newV, prepareOk := px.broadcastPrepare(seq, n)
+
+	if !prepareOk {
+		time.AfterFunc(time.Millisecond*100, func() {
+			px.propose(seq, n, v)
+		})
+	}
+
+	if newV != nil {
+		v = newV
+	}
+
+	newMaxProposal, acceptOk := px.broadcastAccept(seq, n, v)
+
+	if !acceptOk {
+		time.AfterFunc(time.Millisecond*100, func() {
+			px.propose(seq, newMaxProposal, v)
+		})
+	}
+
+	px.mu.Lock()
+	px.log[seq].isDecided = true
+	px.mu.Unlock()
+}
+
 //
 // the application wants paxos to start agreement on
 // instance seq, with proposed value v.
@@ -85,7 +308,16 @@ func call(srv string, name string, args interface{}, reply interface{}) bool {
 // is reached.
 //
 func (px *Paxos) Start(seq int, v interface{}) {
-	// Your code here.
+	log.Printf("Start [%d] [%d] [%v]\n", px.me, seq, v)
+	go func() {
+		px.mu.Lock()
+		px.ensureLogElementExists(seq)
+		px.mu.Unlock()
+
+		elem := px.log[seq]
+
+		px.propose(seq, elem.np, v)
+	}()
 }
 
 //
@@ -149,7 +381,15 @@ func (px *Paxos) Min() int {
 // it should not contact other Paxos peers.
 //
 func (px *Paxos) Status(seq int) (bool, interface{}) {
-	// Your code here.
+	// log.Printf("Status [%d] [%d] [%v]\n", px.me, seq, px.log)
+
+	px.mu.Lock()
+	defer px.mu.Unlock()
+
+	if seq < len(px.log) && px.log[seq].isDecided {
+		return true, px.log[seq].va
+	}
+
 	return false, nil
 }
 
@@ -175,7 +415,7 @@ func Make(peers []string, me int, rpcs *rpc.Server) *Paxos {
 	px.peers = peers
 	px.me = me
 
-	// Your initialization code here.
+	px.log = make([]LogElement, 0)
 
 	if rpcs != nil {
 		// caller will create socket &c
