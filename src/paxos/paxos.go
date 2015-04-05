@@ -62,19 +62,13 @@ type PrepareReply struct {
 }
 
 type AcceptArgs struct {
-	Seq int
-	N   int
-	V   interface{}
+	Seq     int
+	N       int
+	V       interface{}
+	Decided bool
 }
 
 type AcceptReply int
-
-type DecidedArgs struct {
-	Seq int
-	N   int
-}
-
-type DecidedReply bool
 
 //
 // call() sends an RPC to the rpcname handler on server srv
@@ -181,31 +175,12 @@ func (px *Paxos) Accept(args *AcceptArgs, reply *AcceptReply) error {
 		elem.np = args.N
 		elem.na = args.N
 		elem.va = args.V
+		elem.isDecided = args.Decided
 	}
 
 	*reply = AcceptReply(elem.np)
 
 	log.Printf("<-Accept [%d] [%d]\n", px.me, int(*reply))
-
-	return nil
-}
-
-func (px *Paxos) Decided(args *DecidedArgs, reply *DecidedReply) error {
-	log.Printf("Decided<- [%d] [%d] [%d]\n", px.me, args.Seq, args.N)
-
-	px.mu.Lock()
-	defer px.mu.Unlock()
-
-	px.ensureLogElementExists(args.Seq)
-
-	elem := &px.log[args.Seq]
-
-	if elem.na == args.N {
-		elem.isDecided = true
-		*reply = true
-	} else {
-		*reply = false
-	}
 
 	return nil
 }
@@ -309,15 +284,22 @@ func (px *Paxos) broadcastAccept(seq, n int, v interface{}) (maxProposal int, ok
 	return maxProposal, false
 }
 
-func (px *Paxos) broadcastDecided(seq, n int) {
-	args := DecidedArgs{Seq: seq, N: n}
+func (px *Paxos) broadcastDecided(seq, n int, v interface{}) {
+	args := AcceptArgs{Seq: seq, N: n, V: v, Decided: true}
+
+	var mustAccept func(p string)
+	mustAccept = func(p string) {
+		var reply AcceptReply
+		if ok := call(p, "Paxos.Accept", args, &reply); !ok {
+			time.AfterFunc(time.Millisecond*100, func() {
+				mustAccept(p)
+			})
+		}
+	}
 
 	for i, p := range px.peers {
 		if i != px.me {
-			go func(p string) {
-				var reply DecidedReply
-				call(p, "Paxos.Decided", args, &reply)
-			}(p)
+			go mustAccept(p)
 		}
 	}
 }
@@ -353,7 +335,7 @@ func (px *Paxos) propose(seq, maxProposal int, v interface{}) {
 	px.log[seq].isDecided = true
 	px.mu.Unlock()
 
-	px.broadcastDecided(seq, n)
+	px.broadcastDecided(seq, n, v)
 }
 
 //
