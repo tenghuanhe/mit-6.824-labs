@@ -31,6 +31,11 @@ import "math/rand"
 import "time"
 import "io/ioutil"
 
+var (
+	Trace *log.Logger
+	Info  *log.Logger
+)
+
 type Paxos struct {
 	mu         sync.Mutex
 	l          net.Listener
@@ -40,7 +45,9 @@ type Paxos struct {
 	peers      []string
 	me         int // index into peers[]
 	log        []LogElement
-	maxIndex   int
+	maxSeq     int
+	done       []int
+	offset     int
 }
 
 type LogElement struct {
@@ -62,10 +69,12 @@ type PrepareReply struct {
 }
 
 type AcceptArgs struct {
+	From    int
 	Seq     int
 	N       int
 	V       interface{}
 	Decided bool
+	MaxDone int
 }
 
 type AcceptReply int
@@ -108,6 +117,8 @@ func call(srv string, name string, args interface{}, reply interface{}) bool {
 
 func init() {
 	log.SetOutput(ioutil.Discard)
+	Trace = log.New(ioutil.Discard, "", log.Lmicroseconds)
+	Info = log.New(os.Stdout, "", log.Lmicroseconds)
 }
 
 func maxInt(a, b int) int {
@@ -118,31 +129,50 @@ func maxInt(a, b int) int {
 	}
 }
 
-func (px *Paxos) ensureLogElementExists(seq int) bool {
-	log.Printf("ensureLogElementExists<- [%d] [%d] [%d] [%d]\n", px.me, seq, len(px.log), cap(px.log))
+func (px *Paxos) prettyPrintLog(h string) {
+	state := make([]rune, len(px.log))
+	for i := 0; i < len(px.log); i++ {
+		if px.log[i].isDecided {
+			state[i] = '$'
+		} else {
+			state[i] = '.'
+		}
+	}
 
-	px.maxIndex = maxInt(px.maxIndex, seq)
+	Info.Printf("[%s] [%d] [%s] [%d] [%v]\n", h, px.me, string(state), px.offset, px.done)
+}
 
-	if seq < len(px.log) {
+func (px *Paxos) ensureLogElementExists(index int) bool {
+	Trace.Printf("ensureLogElementExists<- [%d] [%d] [%d] [%d]\n", px.me, index, len(px.log), cap(px.log))
+
+	px.maxSeq = maxInt(px.maxSeq, index+px.offset)
+
+	if index < len(px.log) {
 		return true
 	}
 
 	px.log = px.log[0:cap(px.log)]
 
-	if seq < cap(px.log) {
+	if index < cap(px.log) {
 		return true
 	}
 
 	px.log = append(px.log, LogElement{})
 
-	return px.ensureLogElementExists(seq)
+	return px.ensureLogElementExists(index)
 }
 
 func (px *Paxos) Prepare(args *PrepareArgs, reply *PrepareReply) error {
-	log.Printf("Prepare<- [%d] [%d] [%d]\n", px.me, args.Seq, args.N)
+	Trace.Printf("Prepare<- [%d] [%d] [%d]\n", px.me, args.Seq, args.N)
 
 	px.mu.Lock()
 	defer px.mu.Unlock()
+
+	if args.Seq < px.offset {
+		return fmt.Errorf("[%s] Seq: [%d] already forgotten at paxos peer: [%d]", "Prepare", args.Seq, px.me)
+	}
+
+	args.Seq -= px.offset
 
 	px.ensureLogElementExists(args.Seq)
 
@@ -156,16 +186,24 @@ func (px *Paxos) Prepare(args *PrepareArgs, reply *PrepareReply) error {
 	reply.Na = elem.na
 	reply.Va = elem.va
 
-	log.Printf("<-Prepare [%d] [%d] [%d] [%v]\n", px.me, reply.Np, reply.Na, reply.Va)
+	Trace.Printf("<-Prepare [%d] [%d] [%d] [%v]\n", px.me, reply.Np, reply.Na, reply.Va)
 
 	return nil
 }
 
 func (px *Paxos) Accept(args *AcceptArgs, reply *AcceptReply) error {
-	log.Printf("Accept<- [%d] [%d] [%d] [%v]\n", px.me, args.Seq, args.N, args.V)
+	Trace.Printf("Accept<- [%d] [%d] [%d] [%v]\n", px.me, args.Seq, args.N, args.V)
+
+	go px.recdDone(args.From, args.MaxDone)
 
 	px.mu.Lock()
 	defer px.mu.Unlock()
+
+	if args.Seq < px.offset {
+		return fmt.Errorf("[%s] Seq: [%d] already forgotten at paxos peer: [%d]", "Accept", args.Seq, px.me)
+	}
+
+	args.Seq -= px.offset
 
 	px.ensureLogElementExists(args.Seq)
 
@@ -176,11 +214,14 @@ func (px *Paxos) Accept(args *AcceptArgs, reply *AcceptReply) error {
 		elem.na = args.N
 		elem.va = args.V
 		elem.isDecided = args.Decided
+		if elem.isDecided {
+			px.prettyPrintLog("decided")
+		}
 	}
 
 	*reply = AcceptReply(elem.np)
 
-	log.Printf("<-Accept [%d] [%d]\n", px.me, int(*reply))
+	Trace.Printf("<-Accept [%d] [%d]\n", px.me, int(*reply))
 
 	return nil
 }
@@ -212,7 +253,7 @@ func (px *Paxos) broadcastPrepare(seq, n int) (v interface{}, ok bool) {
 		}(i, p)
 	}
 
-	maxProposal := n
+	maxProposal := 0
 	recdCount := 0
 
 	for _ = range px.peers {
@@ -225,20 +266,16 @@ func (px *Paxos) broadcastPrepare(seq, n int) (v interface{}, ok bool) {
 				v = reply.Va
 			}
 			if recdCount > len(px.peers)/2 {
-				break
+				return v, true
 			}
 		}
 	}
 
-	if recdCount < len(px.peers)/2 {
-		return nil, false
-	}
-
-	return v, true
+	return nil, false
 }
 
 func (px *Paxos) broadcastAccept(seq, n int, v interface{}) (maxProposal int, ok bool) {
-	args := AcceptArgs{Seq: seq, N: n, V: v}
+	args := AcceptArgs{Seq: seq, N: n, V: v, MaxDone: px.done[px.me], From: px.me}
 
 	type AcceptChanResponse struct {
 		ok    bool
@@ -285,7 +322,7 @@ func (px *Paxos) broadcastAccept(seq, n int, v interface{}) (maxProposal int, ok
 }
 
 func (px *Paxos) broadcastDecided(seq, n int, v interface{}) {
-	args := AcceptArgs{Seq: seq, N: n, V: v, Decided: true}
+	args := AcceptArgs{Seq: seq, N: n, V: v, Decided: true, MaxDone: px.done[px.me], From: px.me}
 
 	var mustAccept func(p string)
 	mustAccept = func(p string) {
@@ -298,14 +335,17 @@ func (px *Paxos) broadcastDecided(seq, n int, v interface{}) {
 	}
 
 	for i, p := range px.peers {
-		if i != px.me {
+		if i == px.me {
+			var reply AcceptReply
+			px.Accept(&args, &reply)
+		} else {
 			go mustAccept(p)
 		}
 	}
 }
 
 func (px *Paxos) propose(seq, maxProposal int, v interface{}) {
-	log.Printf("propose [%d] [%d] [%d] [%v]\n", px.me, seq, maxProposal, v)
+	Trace.Printf("propose [%d] [%d] [%d] [%v]\n", px.me, seq, maxProposal, v)
 
 	n := (((maxProposal >> 3) + 1) << 3) + px.me
 
@@ -331,10 +371,6 @@ func (px *Paxos) propose(seq, maxProposal int, v interface{}) {
 		return
 	}
 
-	px.mu.Lock()
-	px.log[seq].isDecided = true
-	px.mu.Unlock()
-
 	px.broadcastDecided(seq, n, v)
 }
 
@@ -346,16 +382,46 @@ func (px *Paxos) propose(seq, maxProposal int, v interface{}) {
 // is reached.
 //
 func (px *Paxos) Start(seq int, v interface{}) {
-	log.Printf("Start [%d] [%d] [%v]\n", px.me, seq, v)
+	Trace.Printf("Start [%d] [%d] [%v]\n", px.me, seq, v)
+
+	px.mu.Lock()
+	defer px.mu.Unlock()
+
+	if seq < px.offset {
+		return
+	}
+
+	px.ensureLogElementExists(seq - px.offset)
+
+	elem := px.log[seq-px.offset]
+
 	go func() {
-		px.mu.Lock()
-		px.ensureLogElementExists(seq)
-		px.mu.Unlock()
-
-		elem := px.log[seq]
-
 		px.propose(seq, elem.np, v)
 	}()
+}
+
+func (px *Paxos) recdDone(i int, seq int) {
+	Trace.Printf("recdDone [%d] [%d] [%d] [%d] [%v]\n", px.me, i, seq, px.offset, px.done)
+
+	px.mu.Lock()
+	defer px.mu.Unlock()
+
+	px.done[i] = maxInt(px.done[i], seq)
+
+	mm := px.done[0]
+	for _, e := range px.done[1:] {
+		if e < mm {
+			mm = e
+		}
+	}
+
+	if px.offset <= mm {
+		px.log = px.log[mm-px.offset+1:]
+		px.offset = mm + 1
+		px.prettyPrintLog("done")
+	}
+
+	Trace.Printf("<-recdDone [%d] [%d] [%v]\n", px.me, px.offset, px.done)
 }
 
 //
@@ -365,7 +431,8 @@ func (px *Paxos) Start(seq int, v interface{}) {
 // see the comments for Min() for more explanation.
 //
 func (px *Paxos) Done(seq int) {
-	// Your code here.
+	Trace.Printf("Done [%d] [%d]\n", px.me, seq)
+	px.recdDone(px.me, seq)
 }
 
 //
@@ -374,7 +441,10 @@ func (px *Paxos) Done(seq int) {
 // this peer.
 //
 func (px *Paxos) Max() int {
-	return px.maxIndex
+	px.mu.Lock()
+	defer px.mu.Unlock()
+
+	return px.maxSeq
 }
 
 //
@@ -406,8 +476,11 @@ func (px *Paxos) Max() int {
 // instances.
 //
 func (px *Paxos) Min() int {
-	// You code here.
-	return 0
+	px.mu.Lock()
+	defer px.mu.Unlock()
+
+	Trace.Printf("Min [%d] [%d]\n", px.me, px.offset)
+	return px.offset
 }
 
 //
@@ -418,12 +491,14 @@ func (px *Paxos) Min() int {
 // it should not contact other Paxos peers.
 //
 func (px *Paxos) Status(seq int) (bool, interface{}) {
-	log.Printf("Status [%d] [%d] [%v]\n", px.me, seq, px.log)
+	Trace.Printf("Status [%d] [%d]\n", px.me, seq)
 
 	px.mu.Lock()
 	defer px.mu.Unlock()
 
-	if seq < len(px.log) && px.log[seq].isDecided {
+	seq -= px.offset
+
+	if seq >= 0 && seq < len(px.log) && px.log[seq].isDecided {
 		return true, px.log[seq].va
 	}
 
@@ -453,6 +528,11 @@ func Make(peers []string, me int, rpcs *rpc.Server) *Paxos {
 	px.me = me
 
 	px.log = make([]LogElement, 0)
+	px.maxSeq = -1
+	px.done = make([]int, len(px.peers))
+	for i := range px.done {
+		px.done[i] = -1
+	}
 
 	if rpcs != nil {
 		// caller will create socket &c
