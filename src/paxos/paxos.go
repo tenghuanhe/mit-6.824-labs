@@ -40,6 +40,7 @@ type Paxos struct {
 	peers      []string
 	me         int // index into peers[]
 	log        []LogElement
+	maxIndex   int
 }
 
 type LogElement struct {
@@ -112,16 +113,26 @@ func call(srv string, name string, args interface{}, reply interface{}) bool {
 }
 
 func init() {
-    log.SetOutput(ioutil.Discard)
+	log.SetOutput(ioutil.Discard)
+}
+
+func maxInt(a, b int) int {
+	if a >= b {
+		return a
+	} else {
+		return b
+	}
 }
 
 func (px *Paxos) ensureLogElementExists(seq int) bool {
 	log.Printf("ensureLogElementExists<- [%d] [%d] [%d] [%d]\n", px.me, seq, len(px.log), cap(px.log))
 
+	px.maxIndex = maxInt(px.maxIndex, seq)
+
 	if seq < len(px.log) {
 		return true
 	}
-	
+
 	px.log = px.log[0:cap(px.log)]
 
 	if seq < cap(px.log) {
@@ -288,13 +299,7 @@ func (px *Paxos) broadcastAccept(seq, n int, v interface{}) (maxProposal int, ok
 			if int(reply) == n {
 				acceptOkCount++
 			}
-			maxProposal = func(a, b int) int {
-				if a >= b {
-					return a
-				} else {
-					return b
-				}
-			}(maxProposal, int(reply))
+			maxProposal = maxInt(maxProposal, int(reply))
 			if acceptOkCount > len(px.peers)/2 {
 				return n, true
 			}
@@ -387,8 +392,7 @@ func (px *Paxos) Done(seq int) {
 // this peer.
 //
 func (px *Paxos) Max() int {
-	// Your code here.
-	return 0
+	return px.maxIndex
 }
 
 //
