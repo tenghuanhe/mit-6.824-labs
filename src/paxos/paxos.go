@@ -29,6 +29,7 @@ import "sync"
 import "fmt"
 import "math/rand"
 import "time"
+import "io/ioutil"
 
 type Paxos struct {
 	mu         sync.Mutex
@@ -67,6 +68,13 @@ type AcceptArgs struct {
 
 type AcceptReply int
 
+type DecidedArgs struct {
+	Seq int
+	N   int
+}
+
+type DecidedReply bool
+
 //
 // call() sends an RPC to the rpcname handler on server srv
 // with arguments args, waits for the reply, and leaves the
@@ -103,22 +111,26 @@ func call(srv string, name string, args interface{}, reply interface{}) bool {
 	return false
 }
 
+func init() {
+    log.SetOutput(ioutil.Discard)
+}
+
 func (px *Paxos) ensureLogElementExists(seq int) bool {
+	log.Printf("ensureLogElementExists<- [%d] [%d] [%d] [%d]\n", px.me, seq, len(px.log), cap(px.log))
+
 	if seq < len(px.log) {
 		return true
 	}
+	
+	px.log = px.log[0:cap(px.log)]
 
 	if seq < cap(px.log) {
-		px.log = px.log[0:cap(px.log)]
 		return true
 	}
 
-	for seq >= cap(px.log) {
-		px.log = px.log[0:cap(px.log)]
-		px.log = append(px.log, LogElement{})
-	}
+	px.log = append(px.log, LogElement{})
 
-	return true
+	return px.ensureLogElementExists(seq)
 }
 
 func (px *Paxos) Prepare(args *PrepareArgs, reply *PrepareReply) error {
@@ -163,6 +175,26 @@ func (px *Paxos) Accept(args *AcceptArgs, reply *AcceptReply) error {
 	*reply = AcceptReply(elem.np)
 
 	log.Printf("<-Accept [%d] [%d]\n", px.me, int(*reply))
+
+	return nil
+}
+
+func (px *Paxos) Decided(args *DecidedArgs, reply *DecidedReply) error {
+	log.Printf("Decided<- [%d] [%d] [%d]\n", px.me, args.Seq, args.N)
+
+	px.mu.Lock()
+	defer px.mu.Unlock()
+
+	px.ensureLogElementExists(args.Seq)
+
+	elem := &px.log[args.Seq]
+
+	if elem.na == args.N {
+		elem.isDecided = true
+		*reply = true
+	} else {
+		*reply = false
+	}
 
 	return nil
 }
@@ -247,27 +279,42 @@ func (px *Paxos) broadcastAccept(seq, n int, v interface{}) (maxProposal int, ok
 	}
 
 	maxProposal = n
-	recdCount := 0
+	acceptOkCount := 0
 
 	for _ = range px.peers {
 		response := <-acceptReplies
 		if response.ok {
-			recdCount++
 			reply := response.reply
-			if int(reply) > maxProposal {
-				maxProposal = int(reply)
+			if int(reply) == n {
+				acceptOkCount++
 			}
-			if recdCount > len(px.peers)/2 {
-				break
+			maxProposal = func(a, b int) int {
+				if a >= b {
+					return a
+				} else {
+					return b
+				}
+			}(maxProposal, int(reply))
+			if acceptOkCount > len(px.peers)/2 {
+				return n, true
 			}
 		}
 	}
 
-	if recdCount < len(px.peers)/2 || maxProposal > n {
-		return maxProposal, false
-	}
+	return maxProposal, false
+}
 
-	return n, true
+func (px *Paxos) broadcastDecided(seq, n int) {
+	args := DecidedArgs{Seq: seq, N: n}
+
+	for i, p := range px.peers {
+		if i != px.me {
+			go func(p string) {
+				var reply DecidedReply
+				call(p, "Paxos.Decided", args, &reply)
+			}(p)
+		}
+	}
 }
 
 func (px *Paxos) propose(seq, maxProposal int, v interface{}) {
@@ -281,6 +328,7 @@ func (px *Paxos) propose(seq, maxProposal int, v interface{}) {
 		time.AfterFunc(time.Millisecond*100, func() {
 			px.propose(seq, n, v)
 		})
+		return
 	}
 
 	if newV != nil {
@@ -293,11 +341,14 @@ func (px *Paxos) propose(seq, maxProposal int, v interface{}) {
 		time.AfterFunc(time.Millisecond*100, func() {
 			px.propose(seq, newMaxProposal, v)
 		})
+		return
 	}
 
 	px.mu.Lock()
 	px.log[seq].isDecided = true
 	px.mu.Unlock()
+
+	px.broadcastDecided(seq, n)
 }
 
 //
@@ -381,7 +432,7 @@ func (px *Paxos) Min() int {
 // it should not contact other Paxos peers.
 //
 func (px *Paxos) Status(seq int) (bool, interface{}) {
-	// log.Printf("Status [%d] [%d] [%v]\n", px.me, seq, px.log)
+	log.Printf("Status [%d] [%d] [%v]\n", px.me, seq, px.log)
 
 	px.mu.Lock()
 	defer px.mu.Unlock()
