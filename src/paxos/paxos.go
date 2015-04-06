@@ -213,8 +213,8 @@ func (px *Paxos) Accept(args *AcceptArgs, reply *AcceptReply) error {
 		elem.np = args.N
 		elem.na = args.N
 		elem.va = args.V
-		elem.isDecided = args.Decided
-		if elem.isDecided {
+		if args.Decided {
+			elem.isDecided = args.Decided
 			px.prettyPrintLog("decided")
 		}
 	}
@@ -256,7 +256,7 @@ func (px *Paxos) broadcastPrepare(seq, n int) (v interface{}, ok bool) {
 	maxProposal := 0
 	recdCount := 0
 
-	for _ = range px.peers {
+	for i := range px.peers {
 		response := <-prepareReplies
 		if response.ok {
 			recdCount++
@@ -266,6 +266,12 @@ func (px *Paxos) broadcastPrepare(seq, n int) (v interface{}, ok bool) {
 				v = reply.Va
 			}
 			if recdCount > len(px.peers)/2 {
+				go func(ch chan PrepareChanResponse, r int) {
+					for i := 0; i < r; i++ {
+						<-ch
+					}
+				}(prepareReplies, len(px.peers)-1-i)
+
 				return v, true
 			}
 		}
@@ -304,7 +310,7 @@ func (px *Paxos) broadcastAccept(seq, n int, v interface{}) (maxProposal int, ok
 	maxProposal = n
 	acceptOkCount := 0
 
-	for _ = range px.peers {
+	for i := range px.peers {
 		response := <-acceptReplies
 		if response.ok {
 			reply := response.reply
@@ -313,6 +319,12 @@ func (px *Paxos) broadcastAccept(seq, n int, v interface{}) (maxProposal int, ok
 			}
 			maxProposal = maxInt(maxProposal, int(reply))
 			if acceptOkCount > len(px.peers)/2 {
+				go func(ch chan AcceptChanResponse, r int) {
+					for i := 0; i < r; i++ {
+						<-ch
+					}
+				}(acceptReplies, len(px.peers)-1-i)
+
 				return n, true
 			}
 		}
