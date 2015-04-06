@@ -192,7 +192,11 @@ func (px *Paxos) Prepare(args *PrepareArgs, reply *PrepareReply) error {
 }
 
 func (px *Paxos) Accept(args *AcceptArgs, reply *AcceptReply) error {
-	Trace.Printf("Accept<- [%d] [%d] [%d] [%v]\n", px.me, args.Seq, args.N, args.V)
+	if args.Decided {
+		Trace.Printf("Decided<- [%d] [%d] [%d]\n", px.me, args.Seq, args.N)
+	} else {
+		Trace.Printf("Accept<- [%d] [%d] [%d]\n", px.me, args.Seq, args.N)
+	}
 
 	go px.recdDone(args.From, args.MaxDone)
 
@@ -227,8 +231,6 @@ func (px *Paxos) Accept(args *AcceptArgs, reply *AcceptReply) error {
 }
 
 func (px *Paxos) broadcastPrepare(seq, n int) (v interface{}, ok bool) {
-	args := PrepareArgs{Seq: seq, N: n}
-
 	type PrepareChanResponse struct {
 		ok    bool
 		reply PrepareReply
@@ -239,6 +241,7 @@ func (px *Paxos) broadcastPrepare(seq, n int) (v interface{}, ok bool) {
 	for i, p := range px.peers {
 		go func(i int, p string) {
 			var ok bool
+			args := PrepareArgs{Seq: seq, N: n}
 			var reply PrepareReply
 			if i == px.me {
 				if err := px.Prepare(&args, &reply); err == nil {
@@ -281,8 +284,6 @@ func (px *Paxos) broadcastPrepare(seq, n int) (v interface{}, ok bool) {
 }
 
 func (px *Paxos) broadcastAccept(seq, n int, v interface{}) (maxProposal int, ok bool) {
-	args := AcceptArgs{Seq: seq, N: n, V: v, MaxDone: px.done[px.me], From: px.me}
-
 	type AcceptChanResponse struct {
 		ok    bool
 		reply AcceptReply
@@ -293,6 +294,7 @@ func (px *Paxos) broadcastAccept(seq, n int, v interface{}) (maxProposal int, ok
 	for i, p := range px.peers {
 		go func(i int, p string) {
 			var ok bool
+			args := AcceptArgs{Seq: seq, N: n, V: v, MaxDone: px.done[px.me], From: px.me}
 			var reply AcceptReply
 			if i == px.me {
 				if err := px.Accept(&args, &reply); err == nil {
@@ -334,30 +336,35 @@ func (px *Paxos) broadcastAccept(seq, n int, v interface{}) (maxProposal int, ok
 }
 
 func (px *Paxos) broadcastDecided(seq, n int, v interface{}) {
-	args := AcceptArgs{Seq: seq, N: n, V: v, Decided: true, MaxDone: px.done[px.me], From: px.me}
-
-	var mustAccept func(p string)
-	mustAccept = func(p string) {
+	var mustAccept func(i int, p string)
+	mustAccept = func(i int, p string) {
+		var ok bool
+		args := AcceptArgs{Seq: seq, N: n, V: v, Decided: true, MaxDone: px.done[px.me], From: px.me}
 		var reply AcceptReply
-		if ok := call(p, "Paxos.Accept", args, &reply); !ok {
+		if i == px.me {
+			if err := px.Accept(&args, &reply); err == nil {
+				ok = true
+			} else {
+				ok = false
+			}
+		} else {
+			ok = call(p, "Paxos.Accept", args, &reply)
+		}
+
+		if !ok {
 			time.AfterFunc(time.Millisecond*100, func() {
-				mustAccept(p)
+				mustAccept(i, p)
 			})
 		}
 	}
 
 	for i, p := range px.peers {
-		if i == px.me {
-			var reply AcceptReply
-			px.Accept(&args, &reply)
-		} else {
-			go mustAccept(p)
-		}
+		go mustAccept(i, p)
 	}
 }
 
 func (px *Paxos) propose(seq, maxProposal int, v interface{}) {
-	Trace.Printf("propose [%d] [%d] [%d] [%v]\n", px.me, seq, maxProposal, v)
+	Trace.Printf("propose [%d] [%d] [%d]\n", px.me, seq, maxProposal)
 
 	n := (((maxProposal >> 3) + 1) << 3) + px.me
 
@@ -394,7 +401,7 @@ func (px *Paxos) propose(seq, maxProposal int, v interface{}) {
 // is reached.
 //
 func (px *Paxos) Start(seq int, v interface{}) {
-	Trace.Printf("Start [%d] [%d] [%v]\n", px.me, seq, v)
+	Trace.Printf("Start [%d] [%d]\n", px.me, seq)
 
 	px.mu.Lock()
 	defer px.mu.Unlock()
@@ -413,10 +420,10 @@ func (px *Paxos) Start(seq int, v interface{}) {
 }
 
 func (px *Paxos) recdDone(i int, seq int) {
-	Trace.Printf("recdDone [%d] [%d] [%d] [%d] [%v]\n", px.me, i, seq, px.offset, px.done)
-
 	px.mu.Lock()
 	defer px.mu.Unlock()
+
+	Trace.Printf("recdDone [%d] [%d] [%d] [%d] [%v]\n", px.me, i, seq, px.offset, px.done)
 
 	px.done[i] = maxInt(px.done[i], seq)
 
