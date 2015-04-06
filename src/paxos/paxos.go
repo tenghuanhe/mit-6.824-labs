@@ -118,7 +118,7 @@ func call(srv string, name string, args interface{}, reply interface{}) bool {
 func init() {
 	log.SetOutput(ioutil.Discard)
 	Trace = log.New(ioutil.Discard, "", log.Lmicroseconds)
-	Info = log.New(os.Stdout, "", log.Lmicroseconds)
+	Info = log.New(ioutil.Discard, "", log.Lmicroseconds)
 }
 
 func maxInt(a, b int) int {
@@ -436,6 +436,9 @@ func (px *Paxos) recdDone(i int, seq int) {
 
 	if px.offset <= mm {
 		px.log = px.log[mm-px.offset+1:]
+		newLog := make([]LogElement, len(px.log))
+		copy(newLog, px.log)
+		px.log = newLog
 		px.offset = mm + 1
 		px.prettyPrintLog("done")
 	}
