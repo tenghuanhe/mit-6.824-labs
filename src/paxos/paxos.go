@@ -151,7 +151,7 @@ func (px *Paxos) ensureLogElementExists(index int) bool {
 		return true
 	}
 
-	px.log = px.log[0:cap(px.log)]
+	px.log = px.log[:cap(px.log)]
 
 	if index < cap(px.log) {
 		return true
@@ -228,6 +228,33 @@ func (px *Paxos) Accept(args *AcceptArgs, reply *AcceptReply) error {
 	Trace.Printf("<-Accept [%d] [%d]\n", px.me, int(*reply))
 
 	return nil
+}
+
+func (px *Paxos) recdDone(i int, seq int) {
+	px.mu.Lock()
+	defer px.mu.Unlock()
+
+	Trace.Printf("recdDone<- [%d] [%d] [%d] [%d] [%v]\n", px.me, i, seq, px.offset, px.done)
+
+	px.done[i] = maxInt(px.done[i], seq)
+
+	mm := px.done[0]
+	for _, e := range px.done[1:] {
+		if e < mm {
+			mm = e
+		}
+	}
+
+	if px.offset <= mm {
+		px.log = px.log[mm-px.offset+1:]
+		newLog := make([]LogElement, len(px.log))
+		copy(newLog, px.log)
+		px.log = newLog
+		px.offset = mm + 1
+		px.prettyPrintLog("done")
+	}
+
+	Trace.Printf("<-recdDone [%d] [%d] [%v]\n", px.me, px.offset, px.done)
 }
 
 func (px *Paxos) broadcastPrepare(seq, n int) (v interface{}, ok bool) {
@@ -338,6 +365,11 @@ func (px *Paxos) broadcastAccept(seq, n int, v interface{}) (maxProposal int, ok
 func (px *Paxos) broadcastDecided(seq, n int, v interface{}) {
 	var mustAccept func(i int, p string)
 	mustAccept = func(i int, p string) {
+		if px.dead {
+			Trace.Printf("broadcastDecided - dead - [%d] [%d] [%d]\n", px.me, seq, n)
+			return
+		}
+
 		var ok bool
 		args := AcceptArgs{Seq: seq, N: n, V: v, Decided: true, MaxDone: px.done[px.me], From: px.me}
 		var reply AcceptReply
@@ -365,6 +397,11 @@ func (px *Paxos) broadcastDecided(seq, n int, v interface{}) {
 
 func (px *Paxos) propose(seq, maxProposal int, v interface{}) {
 	Trace.Printf("propose [%d] [%d] [%d]\n", px.me, seq, maxProposal)
+
+	if px.dead {
+		Trace.Printf("propose - dead - [%d] [%d] [%d]\n", px.me, seq, maxProposal)
+		return
+	}
 
 	n := (((maxProposal >> 3) + 1) << 3) + px.me
 
@@ -417,33 +454,6 @@ func (px *Paxos) Start(seq int, v interface{}) {
 	go func() {
 		px.propose(seq, elem.np, v)
 	}()
-}
-
-func (px *Paxos) recdDone(i int, seq int) {
-	px.mu.Lock()
-	defer px.mu.Unlock()
-
-	Trace.Printf("recdDone [%d] [%d] [%d] [%d] [%v]\n", px.me, i, seq, px.offset, px.done)
-
-	px.done[i] = maxInt(px.done[i], seq)
-
-	mm := px.done[0]
-	for _, e := range px.done[1:] {
-		if e < mm {
-			mm = e
-		}
-	}
-
-	if px.offset <= mm {
-		px.log = px.log[mm-px.offset+1:]
-		newLog := make([]LogElement, len(px.log))
-		copy(newLog, px.log)
-		px.log = newLog
-		px.offset = mm + 1
-		px.prettyPrintLog("done")
-	}
-
-	Trace.Printf("<-recdDone [%d] [%d] [%v]\n", px.me, px.offset, px.done)
 }
 
 //
@@ -518,10 +528,8 @@ func (px *Paxos) Status(seq int) (bool, interface{}) {
 	px.mu.Lock()
 	defer px.mu.Unlock()
 
-	seq -= px.offset
-
-	if seq >= 0 && seq < len(px.log) && px.log[seq].isDecided {
-		return true, px.log[seq].va
+	if seq >= px.offset && seq <= px.maxSeq && px.log[seq-px.offset].isDecided {
+		return true, px.log[seq-px.offset].va
 	}
 
 	return false, nil
