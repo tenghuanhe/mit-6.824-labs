@@ -204,7 +204,12 @@ func (px *Paxos) Accept(args *AcceptArgs, reply *AcceptReply) error {
 	defer px.mu.Unlock()
 
 	if args.Seq < px.offset {
-		return fmt.Errorf("[%s] Seq: [%d] already forgotten at paxos peer: [%d]", "Accept", args.Seq, px.me)
+		if args.Decided {
+			Info.Printf("[%s] Seq: [%d] already forgotten at paxos peer: [%d]", "Decided", args.Seq, px.me)
+			return nil
+		} else {
+			return fmt.Errorf("[%s] Seq: [%d] already forgotten at paxos peer: [%d]", "Accept", args.Seq, px.me)
+		}
 	}
 
 	args.Seq -= px.offset
@@ -400,6 +405,15 @@ func (px *Paxos) propose(seq, maxProposal int, v interface{}) {
 
 	if px.dead {
 		Trace.Printf("propose - dead - [%d] [%d] [%d]\n", px.me, seq, maxProposal)
+		return
+	}
+
+	px.mu.Lock()
+	forgotten := seq < px.offset
+	px.mu.Unlock()
+
+	if forgotten {
+		Info.Printf("propose - forgotten - [%d] [%d]\n", px.me, seq)
 		return
 	}
 

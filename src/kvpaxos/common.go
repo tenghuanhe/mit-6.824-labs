@@ -10,13 +10,10 @@ const (
 type Err string
 
 type PutArgs struct {
-	// You'll have to add definitions here.
+	Xid    int64
 	Key    string
 	Value  string
 	DoHash bool // For PutHash
-	// You'll have to add definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
 }
 
 type PutReply struct {
@@ -25,8 +22,8 @@ type PutReply struct {
 }
 
 type GetArgs struct {
+	Xid int64
 	Key string
-	// You'll have to add definitions here.
 }
 
 type GetReply struct {
