@@ -77,8 +77,8 @@ func init() {
 	log.SetOutput(ioutil.Discard)
 	// Trace = log.New(os.Stdout, "", log.Lmicroseconds)
 	Trace = log.New(ioutil.Discard, "", log.Lmicroseconds)
-	// Info = log.New(os.Stdout, "", log.Lmicroseconds)
-	Info = log.New(ioutil.Discard, "", log.Lmicroseconds)
+	Info = log.New(os.Stdout, "", log.Lmicroseconds)
+	// Info = log.New(ioutil.Discard, "", log.Lmicroseconds)
 }
 
 func (kv *KVPaxos) isInstanceDecided(seq int) bool {
@@ -222,61 +222,84 @@ nextRequest:
 
 func (kv *KVPaxos) executeStateMachine() {
 	var i int // current position on log
+	var offset int
 
 	data := make(map[string]string)
 
-	responses := make(map[int]interface{})
+	responses := make([]interface{}, 0)
+
+	ticker := time.NewTicker(time.Millisecond * 500)
+	tickChan := ticker.C
+
+	lastSeqSeen := -1
 
 	for !kv.dead {
-		req := <-kv.subscribe
+		select {
+		case req := <-kv.subscribe:
+			Trace.Printf("[%d] [SM] - Subscribe [%d]\n", kv.me, req.seq)
 
-		Trace.Printf("[%d] [SM] - Subscribe [%d]\n", kv.me, req.seq)
-
-		if resp, ok := responses[req.seq]; ok {
-			Trace.Printf("[%d] [SM] - Early Notify [%d]\n", kv.me, req.seq)
-			req.responseChan <- resp
-			continue
-		}
-
-		for ; i <= req.seq; i++ {
-			Trace.Printf("[%d] [SM] - Processing [%d]\n", kv.me, i)
-
-			if !kv.isInstanceDecided(i) {
-				kv.waitForCommit(i, Op{Id: nrand(), Type: Nop})
+			if req.seq < offset {
+				Info.Printf("[%d] [SM] - Seq [%d] less than offset [%d]\n", kv.me, req.seq, offset)
+				continue
 			}
 
-			_, v := kv.px.Status(i)
-
-			op := v.(Op)
-
-			switch op.Type {
-			case Put:
-				reply := PutReply{PreviousValue: data[op.Key]}
-				data[op.Key] = op.Value
-				responses[i] = reply
-				Info.Printf("[%d] [SM] [%d] - Put [%s] : [%s]\n", kv.me, i, op.Key, op.Value)
-			case PutHash:
-				reply := PutReply{PreviousValue: data[op.Key]}
-				data[op.Key] = strconv.Itoa(int(hash(data[op.Key] + op.Value)))
-				responses[i] = reply
-				Info.Printf("[%d] [SM] [%d] - PutHash [%s] : [%s] -> [%s] -> [%s]\n",
-					kv.me, i, op.Key, op.Value, data[op.Key], reply.PreviousValue)
-			case Get:
-				reply := GetReply{Value: data[op.Key]}
-				responses[i] = reply
-				Info.Printf("[%d] [SM] [%d] - Get [%s] -> [%s]\n", kv.me, i, op.Key, reply.Value)
+			if req.seq < offset+len(responses) {
+				Trace.Printf("[%d] [SM] - Early Notify [%d]\n", kv.me, req.seq)
+				req.responseChan <- responses[req.seq-offset]
+				continue
 			}
+
+			for ; i <= req.seq; i++ {
+				Trace.Printf("[%d] [SM] - Processing [%d]\n", kv.me, i)
+
+				if !kv.isInstanceDecided(i) {
+					kv.waitForCommit(i, Op{Id: nrand(), Type: Nop})
+				}
+
+				_, v := kv.px.Status(i)
+
+				op := v.(Op)
+
+				switch op.Type {
+				case Put:
+					reply := PutReply{PreviousValue: data[op.Key]}
+					data[op.Key] = op.Value
+					responses = append(responses, reply)
+					Trace.Printf("[%d] [SM] [%d] - Put [%s] : [%s]\n", kv.me, i, op.Key, op.Value)
+				case PutHash:
+					reply := PutReply{PreviousValue: data[op.Key]}
+					data[op.Key] = strconv.Itoa(int(hash(data[op.Key] + op.Value)))
+					responses = append(responses, reply)
+					Trace.Printf("[%d] [SM] [%d] - PutHash [%s] : [%s] -> [%s] -> [%s]\n",
+						kv.me, i, op.Key, op.Value, data[op.Key], reply.PreviousValue)
+				case Get:
+					reply := GetReply{Value: data[op.Key]}
+					responses = append(responses, reply)
+					Trace.Printf("[%d] [SM] [%d] - Get [%s] -> [%s]\n", kv.me, i, op.Key, reply.Value)
+				}
+			}
+
+			Trace.Printf("[%d] [SM] - Notify [%d]\n", kv.me, req.seq)
+			req.responseChan <- responses[len(responses)-1]
+
+		case <-tickChan:
+			Info.Printf("[%d] [SM] - Tick - Last: [%d] Cur: [%d] Ops: [%d]\n", kv.me, lastSeqSeen, i-1, i-1-lastSeqSeen)
+			kv.px.Done(lastSeqSeen)
+
+			responses = responses[lastSeqSeen-offset+1:]
+			newResponses := make([]interface{}, len(responses))
+			copy(newResponses, responses)
+			responses = newResponses
+
+			offset = lastSeqSeen + 1
+			lastSeqSeen = i - 1
 		}
-
-		// kv.px.Done(req.seq)
-
-		Trace.Printf("[%d] [SM] - Notify [%d]\n", kv.me, req.seq)
-		req.responseChan <- responses[req.seq]
 	}
+	ticker.Stop()
 }
 
 func (kv *KVPaxos) Get(args *GetArgs, reply *GetReply) error {
-	Info.Printf("[%d] *Get* [%d] - Key [%s]\n", kv.me, args.Xid, args.Key)
+	Trace.Printf("[%d] *Get* [%d] - Key [%s]\n", kv.me, args.Xid, args.Key)
 
 	op := Op{Id: args.Xid, Type: Get, Key: args.Key}
 	responseChan := make(chan interface{})
@@ -297,7 +320,7 @@ func (kv *KVPaxos) Get(args *GetArgs, reply *GetReply) error {
 }
 
 func (kv *KVPaxos) Put(args *PutArgs, reply *PutReply) error {
-	Info.Printf("[%d] *Put* [%d] - Key [%s] Value [%s] DoHash [%t]\n", kv.me, args.Xid, args.Key, args.Value, args.DoHash)
+	Trace.Printf("[%d] *Put* [%d] - Key [%s] Value [%s] DoHash [%t]\n", kv.me, args.Xid, args.Key, args.Value, args.DoHash)
 
 	op := Op{Id: args.Xid, Key: args.Key, Value: args.Value}
 
