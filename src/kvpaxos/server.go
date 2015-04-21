@@ -61,14 +61,16 @@ type RequestState struct {
 }
 
 type KVPaxos struct {
-	mu         sync.Mutex
-	l          net.Listener
-	me         int
-	dead       bool // for testing
-	unreliable bool // for testing
-	px         *paxos.Paxos
-	requests   map[int64]*RequestState
-	subscribe  chan ExecuteRequest
+	mu                       sync.Mutex
+	l                        net.Listener
+	me                       int
+	dead                     bool // for testing
+	unreliable               bool // for testing
+	px                       *paxos.Paxos
+	requests                 map[int64]*RequestState
+	subscribe                chan ExecuteRequest
+	commitRequestsInputChan  chan Op
+	commitRequestsOutputChan chan int
 }
 
 func init() {
@@ -79,31 +81,35 @@ func init() {
 	Info = log.New(ioutil.Discard, "", log.Lmicroseconds)
 }
 
+func (kv *KVPaxos) isInstanceDecided(seq int) bool {
+	decided, v := kv.px.Status(seq)
+	if decided {
+		dop := v.(Op)
+
+		kv.mu.Lock()
+		defer kv.mu.Unlock()
+
+		if reqState, ok := kv.requests[dop.Id]; ok {
+			reqState.state = Committed
+			reqState.seq = seq
+		} else {
+			kv.requests[dop.Id] = &RequestState{
+				xid:   dop.Id,
+				state: Committed,
+				seq:   seq,
+			}
+		}
+		return true
+	}
+	return false
+}
+
 func (kv *KVPaxos) waitForCommit(seq int, op Op) {
 	kv.px.Start(seq, op)
 
 	to := 10 * time.Millisecond
 	for {
-		decided, v := kv.px.Status(seq)
-		if decided {
-			dop := v.(Op)
-
-			kv.mu.Lock()
-			defer kv.mu.Unlock()
-
-			if reqState, ok := kv.requests[dop.Id]; ok {
-				Trace.Printf("[%d] [waitForCommit] - Committed [%d] at [%d]\n", kv.me, dop.Id, seq)
-				reqState.state = Committed
-				reqState.seq = seq
-			} else {
-				Trace.Printf("[%d] [*waitForCommit*] - Committed [%d] at [%d]\n", kv.me, dop.Id, seq)
-				kv.requests[dop.Id] = &RequestState{
-					xid:   dop.Id,
-					state: Committed,
-					seq:   seq,
-				}
-			}
-
+		if kv.isInstanceDecided(seq) {
 			return
 		}
 		time.Sleep(to)
@@ -145,38 +151,72 @@ func (kv *KVPaxos) mustCommit(op Op, responseChan chan interface{}) {
 		return
 	}
 
-	for {
-		seq := kv.px.Max() + 1
-		kv.waitForCommit(seq, op)
+	kv.commitRequestsInputChan <- op
 
+	executeResponseChan := make(chan interface{})
+
+	kv.subscribe <- ExecuteRequest{seq: <-kv.commitRequestsOutputChan, responseChan: executeResponseChan}
+
+	resp := <-executeResponseChan
+
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	reqState := kv.requests[op.Id]
+
+	for _, waitingRequest := range reqState.waiting {
+		waitingRequest <- resp
+	}
+
+	reqState.state = Executed
+}
+
+func (kv *KVPaxos) commitRequests() {
+	var firstUnchosenIndex int
+
+	isRequestCommitted := func(xid int64) int {
 		kv.mu.Lock()
-		state := kv.requests[op.Id].state
-		commitedSeq := kv.requests[op.Id].seq
-		kv.mu.Unlock()
+		defer kv.mu.Unlock()
 
-		if state != Committed {
-			continue
+		reqState, _ := kv.requests[xid]
+		if reqState.state == Committed {
+			Trace.Printf("[%d] [CR] [%d] - Committed at [%d]\n", kv.me, xid, reqState.seq)
+			return reqState.seq
 		}
 
-		responseChan := make(chan interface{})
+		return -1
+	}
 
-		kv.subscribe <- ExecuteRequest{seq: commitedSeq, responseChan: responseChan}
+nextRequest:
+	for !kv.dead {
+		op := <-kv.commitRequestsInputChan
 
-		resp := <-responseChan
+		Trace.Printf("[%d] [CR] - Received [%d]\n", kv.me, op.Id)
 
-		kv.mu.Lock()
-		reqState := kv.requests[op.Id]
-
-		for _, waitingRequest := range reqState.waiting {
-			waitingRequest <- resp
+		if seq := isRequestCommitted(op.Id); seq != -1 {
+			kv.commitRequestsOutputChan <- seq
+			continue nextRequest
 		}
 
-		reqState.state = Executed
+		for ; kv.isInstanceDecided(firstUnchosenIndex); firstUnchosenIndex++ {
+			if seq := isRequestCommitted(op.Id); seq != -1 {
+				kv.commitRequestsOutputChan <- seq
+				continue nextRequest
+			}
+		}
 
-		Trace.Printf("[%d] [mustCommit] [%d] - Executed request at seq [%d]\n", kv.me, op.Id, commitedSeq)
+		for {
+			Trace.Printf("[%d] [CR] - Trying to commit [%d] at [%d]\n", kv.me, op.Id, firstUnchosenIndex)
 
-		kv.mu.Unlock()
-		return
+			kv.waitForCommit(firstUnchosenIndex, op)
+
+			firstUnchosenIndex++
+
+			if seq := isRequestCommitted(op.Id); seq != -1 {
+				kv.commitRequestsOutputChan <- seq
+				continue nextRequest
+			}
+		}
 	}
 }
 
@@ -200,11 +240,12 @@ func (kv *KVPaxos) executeStateMachine() {
 
 		for ; i <= req.seq; i++ {
 			Trace.Printf("[%d] [SM] - Processing [%d]\n", kv.me, i)
-			decided, v := kv.px.Status(i)
-			if !decided {
+
+			if !kv.isInstanceDecided(i) {
 				kv.waitForCommit(i, Op{Id: nrand(), Type: Nop})
-				_, v = kv.px.Status(i)
 			}
+
+			_, v := kv.px.Status(i)
 
 			op := v.(Op)
 
@@ -218,7 +259,7 @@ func (kv *KVPaxos) executeStateMachine() {
 				reply := PutReply{PreviousValue: data[op.Key]}
 				data[op.Key] = strconv.Itoa(int(hash(data[op.Key] + op.Value)))
 				responses[i] = reply
-				Info.Printf("[%d] [SM] [%d] - PutHash [%s] : [%s] -> [%s] -> [%s]\n", 
+				Info.Printf("[%d] [SM] [%d] - PutHash [%s] : [%s] -> [%s] -> [%s]\n",
 					kv.me, i, op.Key, op.Value, data[op.Key], reply.PreviousValue)
 			case Get:
 				reply := GetReply{Value: data[op.Key]}
@@ -303,6 +344,10 @@ func StartServer(servers []string, me int) *KVPaxos {
 	kv.me = me
 	kv.requests = make(map[int64]*RequestState)
 	kv.subscribe = make(chan ExecuteRequest)
+	kv.commitRequestsInputChan = make(chan Op)
+	kv.commitRequestsOutputChan = make(chan int)
+
+	go kv.commitRequests()
 
 	go kv.executeStateMachine()
 
