@@ -48,7 +48,7 @@ type ShardMaster struct {
 func init() {
 	log.SetOutput(ioutil.Discard)
 	Trace = log.New(ioutil.Discard, "", log.Lmicroseconds)
-	Info = log.New(os.Stdout, "", log.Lmicroseconds)
+	Info = log.New(ioutil.Discard, "", log.Lmicroseconds)
 }
 
 func nrand() int64 {
@@ -133,9 +133,14 @@ type CountElem struct {
 
 type ByCurrent []CountElem
 
-func (a ByCurrent) Len() int           { return len(a) }
-func (a ByCurrent) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
-func (a ByCurrent) Less(i, j int) bool { return a[i].current < a[j].current }
+func (a ByCurrent) Len() int      { return len(a) }
+func (a ByCurrent) Swap(i, j int) { a[i], a[j] = a[j], a[i] }
+func (a ByCurrent) Less(i, j int) bool {
+	if a[i].current != a[j].current {
+		return a[i].current < a[j].current
+	}
+	return a[i].gid < a[j].gid
+}
 
 type ByDeficit []CountElem
 
@@ -155,18 +160,13 @@ func optimalConfiguration(Nshards int, Kservers int) []int {
 	return conf
 }
 
-func shuffle(shards [NShards]int64, gid int64) [NShards]int64 {
-	Trace.Printf("[shuffle] - Received shards: %v gid: [%d]\n", shards, gid)
+func (sm *ShardMaster) shuffle(gid int64) [NShards]int64 {
+	shards := sm.configs[len(sm.configs)-1].Shards
 
 	counts := make(map[int64]*CountElem)
 
-	for _, g := range shards {
-		if g > 0 {
-			if counts[g] == nil {
-				counts[g] = &CountElem{gid: g}
-			}
-			counts[g].current++
-		}
+	for g, _ := range sm.configs[len(sm.configs)-1].Groups {
+		counts[g] = &CountElem{gid: g}
 	}
 
 	if len(counts) == 0 {
@@ -179,6 +179,10 @@ func shuffle(shards [NShards]int64, gid int64) [NShards]int64 {
 		return newShards
 	}
 
+	for _, g := range shards {
+		counts[g].current++
+	}
+
 	countsList := make([]CountElem, 0)
 	for g, elem := range counts {
 		if g != gid {
@@ -186,7 +190,7 @@ func shuffle(shards [NShards]int64, gid int64) [NShards]int64 {
 		}
 	}
 
-	sort.Sort(ByCurrent(countsList))
+	sort.Sort(sort.Reverse(ByCurrent(countsList)))
 
 	var optimal []int
 
@@ -208,8 +212,6 @@ func shuffle(shards [NShards]int64, gid int64) [NShards]int64 {
 	Trace.Printf("[shuffle] - countsList: %v\n", countsList)
 
 	sort.Sort(sort.Reverse(ByDeficit(countsList)))
-
-	Trace.Printf("[shuffle] - ByDeficit(countsList): %v\n", countsList)
 
 	curr := len(countsList) - 1
 
@@ -243,6 +245,8 @@ func copyGroups(groups map[int64][]string) map[int64][]string {
 }
 
 func (sm *ShardMaster) join(args *JoinArgs) {
+	Trace.Printf("[%d] [SM] *Join* - GID [%d]\n", sm.me, args.GID)
+
 	if _, ok := sm.configs[len(sm.configs)-1].Groups[args.GID]; ok {
 		return
 	}
@@ -257,7 +261,7 @@ func (sm *ShardMaster) join(args *JoinArgs) {
 
 	newConfig := Config{
 		Num:    sm.configs[len(sm.configs)-1].Num + 1,
-		Shards: shuffle(sm.configs[len(sm.configs)-1].Shards, args.GID),
+		Shards: sm.shuffle(args.GID),
 		Groups: newGroups,
 	}
 
@@ -265,6 +269,8 @@ func (sm *ShardMaster) join(args *JoinArgs) {
 }
 
 func (sm *ShardMaster) leave(args *LeaveArgs) {
+	Trace.Printf("[%d] [SM] *Leave* - GID [%d]\n", sm.me, args.GID)
+
 	if _, ok := sm.configs[len(sm.configs)-1].Groups[args.GID]; !ok {
 		return
 	}
@@ -275,7 +281,7 @@ func (sm *ShardMaster) leave(args *LeaveArgs) {
 
 	newConfig := Config{
 		Num:    sm.configs[len(sm.configs)-1].Num + 1,
-		Shards: shuffle(sm.configs[len(sm.configs)-1].Shards, args.GID),
+		Shards: sm.shuffle(args.GID),
 		Groups: newGroups,
 	}
 
@@ -283,6 +289,8 @@ func (sm *ShardMaster) leave(args *LeaveArgs) {
 }
 
 func (sm *ShardMaster) move(args *MoveArgs) {
+	Trace.Printf("[%d] [SM] *Move* - Shard: [%d] to GID: [%d]\n", sm.me, args.Shard, args.GID)
+
 	newShards := sm.configs[len(sm.configs)-1].Shards
 
 	newShards[args.Shard] = args.GID
@@ -415,10 +423,10 @@ func (sm *ShardMaster) Kill() {
 //
 func StartServer(servers []string, me int) *ShardMaster {
 	gob.Register(Op{})
-	gob.Register(JoinArgs{})
-	gob.Register(LeaveArgs{})
-	gob.Register(MoveArgs{})
-	gob.Register(QueryArgs{})
+	gob.Register(&JoinArgs{})
+	gob.Register(&LeaveArgs{})
+	gob.Register(&MoveArgs{})
+	gob.Register(&QueryArgs{})
 
 	sm := new(ShardMaster)
 	sm.me = me
