@@ -144,9 +144,14 @@ func (a ByCurrent) Less(i, j int) bool {
 
 type ByDeficit []CountElem
 
-func (a ByDeficit) Len() int           { return len(a) }
-func (a ByDeficit) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
-func (a ByDeficit) Less(i, j int) bool { return a[i].current-a[i].desired < a[j].current-a[j].desired }
+func (a ByDeficit) Len() int      { return len(a) }
+func (a ByDeficit) Swap(i, j int) { a[i], a[j] = a[j], a[i] }
+func (a ByDeficit) Less(i, j int) bool {
+	if a[i].current-a[i].desired != a[j].current-a[j].desired {
+		return a[i].current-a[i].desired < a[j].current-a[j].desired
+	}
+	return a[i].gid < a[j].gid
+}
 
 func optimalConfiguration(Nshards int, Kservers int) []int {
 	conf := make([]int, Kservers)
@@ -213,6 +218,8 @@ func (sm *ShardMaster) shuffle(gid int64) [NShards]int64 {
 
 	sort.Sort(sort.Reverse(ByDeficit(countsList)))
 
+	Trace.Printf("[shuffle] - ByDeficit(countsList): %v\n", countsList)
+
 	curr := len(countsList) - 1
 
 	newShards := shards
@@ -221,9 +228,9 @@ func (sm *ShardMaster) shuffle(gid int64) [NShards]int64 {
 		if counts[g].desired > 0 {
 			counts[g].desired--
 		} else {
-			newShards[i] = countsList[curr].gid
-			counts[shards[i]].desired--
-			if counts[shards[i]].desired == 0 {
+			recvGroup := countsList[curr].gid
+			newShards[i] = recvGroup
+			if counts[recvGroup].desired--; counts[recvGroup].desired == 0 {
 				curr--
 			}
 		}
