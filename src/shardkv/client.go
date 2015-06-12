@@ -5,6 +5,8 @@ import "net/rpc"
 import "time"
 import "sync"
 import "fmt"
+import "crypto/rand"
+import "math/big"
 
 type Clerk struct {
 	mu     sync.Mutex // one RPC at a time
@@ -18,6 +20,13 @@ func MakeClerk(shardmasters []string) *Clerk {
 	ck.sm = shardmaster.MakeClerk(shardmasters)
 	// You'll have to modify MakeClerk.
 	return ck
+}
+
+func nrand() int64 {
+	max := big.NewInt(int64(1) << 62)
+	bigx, _ := rand.Int(rand.Reader, max)
+	x := bigx.Int64()
+	return x
 }
 
 //

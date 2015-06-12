@@ -12,6 +12,7 @@ import "syscall"
 import "encoding/gob"
 import "math/rand"
 import "shardmaster"
+import "strconv"
 import "io/ioutil"
 
 const Debug = 0
@@ -26,13 +27,6 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 var (
 	Trace *log.Logger
 	Info  *log.Logger
-)
-
-const (
-	Put     = "Put"
-	PutHash = "PutHash"
-	Get     = "Get"
-	Nop     = "Nop"
 )
 
 const (
@@ -51,6 +45,7 @@ type RequestState struct {
 	state   string
 	seq     int
 	waiting []chan interface{}
+	resp    interface{}
 }
 
 type StartHandoff struct {
@@ -59,6 +54,8 @@ type StartHandoff struct {
 }
 
 type EndHandoff int
+
+type Nop int
 
 type ShardData struct {
 	mu       sync.Mutex
@@ -106,6 +103,46 @@ func getWrongGroupReply(op Op) (reply interface{}) {
 	return
 }
 
+func (kv *ShardKV) isInstanceDecided(seq int) bool {
+	decided, v := kv.px.Status(seq)
+	if decided {
+		dop := v.(Op)
+
+		tablet := kv.dataForShard[dop.Shard]
+
+		tablet.mu.Lock()
+		defer tablet.mu.Unlock()
+
+		if reqState, ok := tablet.Requests[dop.Id]; ok {
+			reqState.state = Committed
+			reqState.seq = seq
+		} else {
+			tablet.Requests[dop.Id] = &RequestState{
+				xid:   dop.Id,
+				state: Committed,
+				seq:   seq,
+			}
+		}
+		return true
+	}
+	return false
+}
+
+func (kv *ShardKV) waitForCommit(seq int, op Op) {
+	kv.px.Start(seq, op)
+
+	to := 10 * time.Millisecond
+	for {
+		if kv.isInstanceDecided(seq) {
+			return
+		}
+		time.Sleep(to)
+		if to < 10*time.Second {
+			to *= 2
+		}
+	}
+}
+
 func (kv *ShardKV) requestExists(op Op, responseChan chan interface{}) bool {
 	tablet := kv.dataForShard[op.Shard]
 
@@ -149,9 +186,12 @@ func (kv *ShardKV) mustCommit(op Op, responseChan chan interface{}) {
 
 	seq := <-kv.commitResponse
 
-	tablet := kv.dataForShard[op.Shard]
-
 	flushResponse := func(resp interface{}) {
+		tablet := kv.dataForShard[op.Shard]
+
+		tablet.mu.Lock()
+		defer tablet.mu.Unlock()
+
 		for _, waitingRequest := range tablet.Requests[op.Id].waiting {
 			waitingRequest <- resp
 		}
@@ -164,16 +204,154 @@ func (kv *ShardKV) mustCommit(op Op, responseChan chan interface{}) {
 
 	executeResponseChan := make(chan interface{})
 
-	kv.subscribe <- ExecuteRequest{seq: <-kv.commitResponse, responseChan: executeResponseChan}
+	kv.subscribe <- ExecuteRequest{seq: seq, responseChan: executeResponseChan}
 
-	resp := <-executeResponseChan
+	flushResponse(<-executeResponseChan)
+}
+
+func (kv *ShardKV) commitRequests() {
+	var firstUnchosenIndex int
+
+	isRequestCommitted := func(num int, xid int64) int {
+		tablet := kv.dataForShard[num]
+
+		tablet.mu.Lock()
+		defer tablet.mu.Unlock()
+
+		reqState, _ := tablet.Requests[xid]
+		if reqState.state == Committed {
+			Trace.Printf("[%d] [%d] [CR] [%d] - Committed at [%d]\n", kv.gid, kv.me, xid, reqState.seq)
+			return reqState.seq
+		}
+
+		return -1
+	}
+
+nextRequest:
+	for !kv.dead {
+		op := <-kv.commitRequest
+
+		Trace.Printf("[%d] [%d] [CR] - Received [%d]\n", kv.gid, kv.me, op.Id)
+
+		if seq := isRequestCommitted(op.Shard, op.Id); seq != -1 {
+			kv.commitResponse <- seq
+			continue nextRequest
+		}
+
+		for kv.isInstanceDecided(firstUnchosenIndex) {
+			firstUnchosenIndex++
+			if seq := isRequestCommitted(op.Shard, op.Id); seq != -1 {
+				kv.commitResponse <- seq
+				continue nextRequest
+			}
+		}
+
+		for {
+			Trace.Printf("[%d] [%d] [CR] - Trying to commit [%d] at [%d]\n", kv.gid, kv.me, op.Id, firstUnchosenIndex)
+
+			kv.waitForCommit(firstUnchosenIndex, op)
+
+			firstUnchosenIndex++
+
+			if seq := isRequestCommitted(op.Shard, op.Id); seq != -1 {
+				kv.commitResponse <- seq
+				continue nextRequest
+			}
+		}
+	}
+}
+
+type MapEntry struct {
+	num int
+	xid int64
+}
+
+func (kv *ShardKV) put(i int, op Op) {
+	args := op.Args.(*PutArgs)
+	tablet := kv.dataForShard[op.Shard]
 
 	tablet.mu.Lock()
 	defer tablet.mu.Unlock()
 
-	flushResponse(resp)
+	var reply PutReply
+	if tablet.active {
+		reply = PutReply{PreviousValue: tablet.Data[args.Key]}
+		if args.DoHash {
+			tablet.Data[args.Key] = strconv.Itoa(int(hash(tablet.Data[args.Key] + args.Value)))
+			Trace.Printf("[%d] [%d] [SM] [%d] - PutHash [%s] : [%s] -> [%s] -> [%s]\n",
+				kv.gid, kv.me, i, args.Key, args.Value, tablet.Data[args.Key], reply.PreviousValue)
+		} else {
+			tablet.Data[args.Key] = args.Value
+			Trace.Printf("[%d] [%d] [SM] [%d] - Put [%s] : [%s]\n", kv.gid, kv.me, i, args.Key, args.Value)
+		}
+		tablet.Requests[op.Id].state = Executed
+	} else {
+		reply = getWrongGroupReply(op).(PutReply)
+	}
 
-	tablet.Requests[op.Id].state = Executed
+	tablet.Requests[op.Id].resp = reply
+}
+
+func (kv *ShardKV) get(i int, op Op) {
+	args := op.Args.(*GetArgs)
+	tablet := kv.dataForShard[op.Shard]
+
+	tablet.mu.Lock()
+	defer tablet.mu.Unlock()
+
+	var reply GetReply
+	if tablet.active {
+		reply = GetReply{Value: tablet.Data[args.Key]}
+		tablet.Requests[op.Id].state = Executed
+	} else {
+		reply = getWrongGroupReply(op).(GetReply)
+	}
+
+	tablet.Requests[op.Id].resp = reply
+}
+
+func (kv *ShardKV) executeStateMachine() {
+	var i int // current position on log
+
+	log := make([]MapEntry, 0)
+
+	for !kv.dead {
+		req := <-kv.subscribe
+		Trace.Printf("[%d] [%d] [SM] - Subscribe [%d]\n", kv.gid, kv.me, req.seq)
+
+		if req.seq < len(log) {
+			Trace.Printf("[%d] [%d] [SM] - Early Notify [%d]\n", kv.gid, kv.me, req.seq)
+			e := log[req.seq]
+			req.responseChan <- kv.dataForShard[e.num].Requests[e.xid].resp
+			continue
+		}
+
+		for ; i <= req.seq; i++ {
+			Trace.Printf("[%d] [%d] [SM] - Processing [%d]\n", kv.gid, kv.me, i)
+
+			if !kv.isInstanceDecided(i) {
+				kv.waitForCommit(i, Op{Id: nrand(), Args: Nop(0), Shard: -1})
+			}
+
+			_, v := kv.px.Status(i)
+
+			op := v.(Op)
+
+			switch op.Args.(type) {
+			case *PutArgs:
+				kv.put(i, op)
+			case *GetArgs:
+				kv.get(i, op)
+			}
+
+			log = append(log, MapEntry{op.Shard, op.Id})
+		}
+
+		Trace.Printf("[%d] [%d] [SM] - Notify [%d]\n", kv.gid, kv.me, req.seq)
+
+		e := log[len(log)-1]
+		req.responseChan <- kv.dataForShard[e.num].Requests[e.xid].resp
+	}
 }
 
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) error {
@@ -249,8 +427,20 @@ func StartServer(gid int64, shardmasters []string,
 	kv.gid = gid
 	kv.sm = shardmaster.MakeClerk(shardmasters)
 
-	// Your initialization code here.
-	// Don't call Join().
+	for i := range kv.dataForShard {
+		kv.dataForShard[i] = &ShardData{
+			Data:     make(map[string]string),
+			Requests: make(map[int64]*RequestState),
+		}
+	}
+
+	kv.subscribe = make(chan ExecuteRequest)
+	kv.commitRequest = make(chan Op)
+	kv.commitResponse = make(chan int)
+
+	go kv.commitRequests()
+
+	go kv.executeStateMachine()
 
 	rpcs := rpc.NewServer()
 	rpcs.Register(kv)
