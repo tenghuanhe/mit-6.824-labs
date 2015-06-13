@@ -1,6 +1,8 @@
 package shardkv
 
 import "hash/fnv"
+import "time"
+import "encoding/gob"
 
 //
 // Sharded key/value server.
@@ -15,6 +17,7 @@ const (
 	OK            = "OK"
 	ErrNoKey      = "ErrNoKey"
 	ErrWrongGroup = "ErrWrongGroup"
+	ErrNotFound   = "ErrNotFound"
 )
 
 type Err string
@@ -41,8 +44,38 @@ type GetReply struct {
 	Value string
 }
 
+type GetShardArgs struct {
+	Shard int
+	Num   int
+}
+
+type GetShardReply struct {
+	Err  Err
+	Data ShardData
+}
+
+const PingInterval = time.Millisecond * 100
+
+const DeadPings = 5
+
+type PingArgs struct {
+	Me  int
+	Num int
+	Bid int
+}
+
+type PingReply struct {
+}
+
 func hash(s string) uint32 {
 	h := fnv.New32a()
 	h.Write([]byte(s))
 	return h.Sum32()
+}
+
+func hashConfigBid(c *ConfigBid) int64 {
+	h := fnv.New64a()
+	encoder := gob.NewEncoder(h)
+	encoder.Encode(*c)
+	return int64(h.Sum64() >> 1)
 }

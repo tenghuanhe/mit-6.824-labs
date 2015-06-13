@@ -85,7 +85,7 @@ func (ck *Clerk) Get(key string) string {
 	ck.mu.Lock()
 	defer ck.mu.Unlock()
 
-	// You'll have to modify Get().
+	xid := nrand()
 
 	for {
 		shard := key2shard(key)
@@ -98,6 +98,7 @@ func (ck *Clerk) Get(key string) string {
 			// try each server in the shard's replication group.
 			for _, srv := range servers {
 				args := &GetArgs{}
+				args.Xid = xid
 				args.Key = key
 				var reply GetReply
 				ok := call(srv, "ShardKV.Get", args, &reply)
@@ -122,7 +123,7 @@ func (ck *Clerk) PutExt(key string, value string, dohash bool) string {
 	ck.mu.Lock()
 	defer ck.mu.Unlock()
 
-	// You'll have to modify Put().
+	xid := nrand()
 
 	for {
 		shard := key2shard(key)
@@ -135,6 +136,7 @@ func (ck *Clerk) PutExt(key string, value string, dohash bool) string {
 			// try each server in the shard's replication group.
 			for _, srv := range servers {
 				args := &PutArgs{}
+				args.Xid = xid
 				args.Key = key
 				args.Value = value
 				args.DoHash = dohash
