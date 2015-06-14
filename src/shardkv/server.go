@@ -213,7 +213,7 @@ func (kv *ShardKV) mustCommit(op Op, responseChan chan interface{}) {
 		}
 	}
 
-	if seq == -1 {
+	if seq == -2 {
 		flushResponse(getWrongGroupReply(op))
 		return
 	}
@@ -233,6 +233,11 @@ func (kv *ShardKV) commitRequests() {
 
 		tablet.mu.Lock()
 		defer tablet.mu.Unlock()
+
+		if !(tablet.active || num == shardmaster.NShards) {
+			Trace.Printf("[%d] [%d] [CR] [%d] - Shard [%d] Inactive\n", kv.gid, kv.me, xid, num)
+			return -2
+		}
 
 		reqState, _ := tablet.Requests[xid]
 		if reqState.State == Committed {
@@ -438,6 +443,8 @@ func (kv *ShardKV) prettyPrintConfig(h string, current *shardmaster.Config, late
 		}
 	}
 
+	h = fmt.Sprintf("\033[1m\033[35m%s\033[0m", h)
+
 	Info.Printf("[%d] [%d] [%s] - Num [%d] [%s]\n", kv.gid, kv.me, h, latest.Num, strings.Join(state, " "))
 }
 
@@ -542,6 +549,8 @@ func (kv *ShardKV) startHandoff(i int, op Op) {
 	} else {
 		go kv.followerStartHandoff(&args.Id.Config, args.Id.Bid, args.Leader)
 	}
+
+	metaTablet.Requests[op.Id].State = Executed
 }
 
 func (kv *ShardKV) leaderStartHandoff(latest *shardmaster.Config, bid int, shardsToBeMoved []ShardState) {
@@ -593,7 +602,11 @@ loop:
 		}
 	}
 
-	if metaTablet.active {
+	metaTablet.mu.Lock()
+	active := metaTablet.active
+	metaTablet.mu.Unlock()
+
+	if active {
 		return
 	}
 
@@ -641,10 +654,7 @@ func (kv *ShardKV) fetchShards(latest *shardmaster.Config, shardsToBeMoved []Sha
 				if ok && reply.Err == OK {
 					addToLocalStorage(&reply.Data)
 					return
-				} else {
-
 				}
-
 			}
 			time.Sleep(100 * time.Millisecond)
 		}
@@ -714,6 +724,8 @@ func (kv *ShardKV) endHandoff(i int, op Op) {
 	}()
 
 	kv.config = args.Id.Config
+
+	metaTablet.Requests[op.Id].State = Executed
 }
 
 func (kv *ShardKV) reconfigure(latest *shardmaster.Config, bid int) {
@@ -809,7 +821,7 @@ func StartServer(gid int64, shardmasters []string,
 	kv.subscribe = make(chan ExecuteRequest)
 	kv.commitRequest = make(chan Op)
 	kv.commitResponse = make(chan int)
-	kv.ping = make(chan PingArgs)
+	kv.ping = make(chan PingArgs, 100)
 
 	go kv.commitRequests()
 
