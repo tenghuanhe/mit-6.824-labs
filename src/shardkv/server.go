@@ -101,8 +101,9 @@ type ShardKV struct {
 
 func init() {
 	log.SetOutput(ioutil.Discard)
-	Trace = log.New(os.Stdout, "", log.Lmicroseconds)
+	Trace = log.New(ioutil.Discard, "", log.Lmicroseconds)
 	Info = log.New(os.Stdout, "", log.Lmicroseconds)
+	rand.Seed(time.Now().UTC().UnixNano())
 }
 
 func getWrongGroupReply(op Op) (reply interface{}) {
@@ -163,12 +164,13 @@ func (kv *ShardKV) requestExists(op Op, responseChan chan interface{}) bool {
 	defer tablet.mu.Unlock()
 
 	if !(tablet.active || op.Shard == shardmaster.NShards) {
+		Trace.Printf("[%d] [%d] [mustCommit] [%d] - Shard [%d] Inactive\n", kv.gid, kv.me, op.Id, op.Shard)
 		responseChan <- getWrongGroupReply(op)
 		return true
 	}
 
 	if reqState, ok := tablet.Requests[op.Id]; ok {
-		Trace.Printf("[[%d] [%d] [mustCommit] [%d] - Request exists with state [%s]\n", kv.gid, kv.me, op.Id, reqState.State)
+		Trace.Printf("[%d] [%d] [mustCommit] [%d] - Request exists with state [%s]\n", kv.gid, kv.me, op.Id, reqState.State)
 
 		if reqState.State != Executed {
 			reqState.waiting = append(reqState.waiting, responseChan)
@@ -335,14 +337,15 @@ func (kv *ShardKV) put(i int, op Op) {
 		reply = PutReply{PreviousValue: tablet.Data[args.Key]}
 		if args.DoHash {
 			tablet.Data[args.Key] = strconv.Itoa(int(hash(tablet.Data[args.Key] + args.Value)))
-			Trace.Printf("[%d] [%d] [SM] [%d] - PutHash [%s] : [%s] -> [%s] -> [%s]\n",
-				kv.gid, kv.me, i, args.Key, args.Value, tablet.Data[args.Key], reply.PreviousValue)
+			Trace.Printf("[%d] [%d] [SM] [%d] #[%d] - PutHash [%s] : [%s] -> [%s] -> [%s]\n",
+				kv.gid, kv.me, i, op.Shard, args.Key, args.Value, tablet.Data[args.Key], reply.PreviousValue)
 		} else {
 			tablet.Data[args.Key] = args.Value
-			Trace.Printf("[%d] [%d] [SM] [%d] - Put [%s] : [%s]\n", kv.gid, kv.me, i, args.Key, args.Value)
+			Trace.Printf("[%d] [%d] [SM] [%d] #[%d] - Put [%s] : [%s]\n", kv.gid, kv.me, i, op.Shard, args.Key, args.Value)
 		}
 		tablet.Requests[op.Id].State = Executed
 	} else {
+		Trace.Printf("[%d] [%d] [SM] [%d] #[%d] - Shard Inactive - Put [%s]\n", kv.gid, kv.me, i, op.Shard, args.Key)
 		reply = getWrongGroupReply(op).(PutReply)
 	}
 
@@ -359,9 +362,10 @@ func (kv *ShardKV) get(i int, op Op) {
 	var reply GetReply
 	if tablet.active {
 		reply = GetReply{Value: tablet.Data[args.Key]}
-		Trace.Printf("[%d] [%d] [SM] [%d] - Get [%s] -> [%s]\n", kv.gid, kv.me, i, args.Key, reply.Value)
+		Trace.Printf("[%d] [%d] [SM] [%d] #[%d] - Get [%s] -> [%s]\n", kv.gid, kv.me, i, op.Shard, args.Key, reply.Value)
 		tablet.Requests[op.Id].State = Executed
 	} else {
+		Trace.Printf("[%d] [%d] [SM] [%d] #[%d] - Shard Inactive - Get [%s]\n", kv.gid, kv.me, i, op.Shard, args.Key)
 		reply = getWrongGroupReply(op).(GetReply)
 	}
 
@@ -369,11 +373,13 @@ func (kv *ShardKV) get(i int, op Op) {
 }
 
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) error {
-	Trace.Printf("[%d] [%d] *Get* [%d] - Key [%s]\n", kv.gid, kv.me, args.Xid, args.Key)
+	shard := key2shard(args.Key)
+
+	Info.Printf("[%d] [%d] *Get* [%d] #[%d] - Key [%s]\n", kv.gid, kv.me, args.Xid, shard, args.Key)
 
 	responseChan := make(chan interface{})
 
-	go kv.mustCommit(Op{Id: args.Xid, Args: args, Shard: key2shard(args.Key)}, responseChan)
+	go kv.mustCommit(Op{Id: args.Xid, Args: args, Shard: shard}, responseChan)
 
 	resp := <-responseChan
 
@@ -391,12 +397,14 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) error {
 }
 
 func (kv *ShardKV) Put(args *PutArgs, reply *PutReply) error {
-	Trace.Printf("[%d] [%d] *Put* [%d] - Key [%s] Value [%s] DoHash [%t]\n",
-		kv.gid, kv.me, args.Xid, args.Key, args.Value, args.DoHash)
+	shard := key2shard(args.Key)
+
+	Info.Printf("[%d] [%d] *Put* [%d] #[%d] - Key [%s] Value [%s] DoHash [%t]\n",
+		kv.gid, kv.me, args.Xid, shard, args.Key, args.Value, args.DoHash)
 
 	responseChan := make(chan interface{})
 
-	go kv.mustCommit(Op{Id: args.Xid, Args: args, Shard: key2shard(args.Key)}, responseChan)
+	go kv.mustCommit(Op{Id: args.Xid, Args: args, Shard: shard}, responseChan)
 
 	resp := <-responseChan
 
@@ -430,11 +438,12 @@ func (kv *ShardKV) prettyPrintConfig(h string, current *shardmaster.Config, late
 		}
 	}
 
-	Info.Printf("[%s] [%d] [%d] [%d] [%s]\n", h, kv.gid, kv.me, latest.Num, strings.Join(state, " "))
+	Info.Printf("[%d] [%d] [%s] - Num [%d] [%s]\n", kv.gid, kv.me, h, latest.Num, strings.Join(state, " "))
 }
 
 func (kv *ShardKV) Ping(args *PingArgs, reply *PingReply) error {
-	Trace.Printf("[%d] [%d] *Ping* - From [%d] Num [%d] Bid [%d]\n", kv.gid, kv.me, args.Me, args.Num, args.Bid)
+	Trace.Printf("[%d] [%d] *Ping* - From [%d] Num [%d] Bid [%d] Done [%t]\n",
+		kv.gid, kv.me, args.Me, args.Num, args.Bid, args.Done)
 
 	metaTablet := kv.dataForShard[shardmaster.NShards]
 
@@ -446,8 +455,6 @@ func (kv *ShardKV) Ping(args *PingArgs, reply *PingReply) error {
 }
 
 func (kv *ShardKV) GetShard(args *GetShardArgs, reply *GetShardReply) error {
-	Trace.Printf("[%d] [%d] *GetShard* - Shard [%d] Num [%d]\n", kv.gid, kv.me, args.Shard, args.Num)
-
 	tablet := kv.dataForShard[args.Shard]
 
 	tablet.mu.Lock()
@@ -463,10 +470,16 @@ func (kv *ShardKV) GetShard(args *GetShardArgs, reply *GetShardReply) error {
 			}
 		}
 
+		Trace.Printf("[%d] [%d] *GetShard* - Shard [%d] Num [%d] -> [%s]\n",
+			kv.gid, kv.me, args.Shard, args.Num, reply.Err)
+
 		return nil
 	}
 
 	reply.Err = ErrNotFound
+
+	Trace.Printf("[%d] [%d] *GetShard* - Shard [%d] Num [%d] -> [%s]\n",
+		kv.gid, kv.me, args.Shard, args.Num, reply.Err)
 
 	return nil
 }
@@ -500,7 +513,7 @@ func (kv *ShardKV) isHandoffRequired(latest *shardmaster.Config) (result []Shard
 func (kv *ShardKV) startHandoff(i int, op Op) {
 	args := op.Args.(*StartHandoff)
 
-	Trace.Printf("[%d] [%d] [SM] [%d] - Start Handoff Num [%d] Bid [%d] Leader [%d]\n",
+	Info.Printf("[%d] [%d] [SM] [%d] - \033[32mStart Handoff\033[0m Num [%d] Bid [%d] Leader [%d]\n",
 		kv.gid, kv.me, i, args.Id.Config.Num, args.Id.Bid, args.Leader)
 
 	metaTablet := kv.dataForShard[shardmaster.NShards]
@@ -532,13 +545,16 @@ func (kv *ShardKV) startHandoff(i int, op Op) {
 }
 
 func (kv *ShardKV) leaderStartHandoff(latest *shardmaster.Config, bid int, shardsToBeMoved []ShardState) {
+	Info.Printf("[%d] [%d] [Leader Start Handoff] - Num [%d] Bid [%d] Shards Affected [%d]\n",
+		kv.gid, kv.me, latest.Num, bid, len(shardsToBeMoved))
+
 	go func() {
 		metaTablet := kv.dataForShard[shardmaster.NShards]
 
 		for !metaTablet.active {
 			for i, srv := range latest.Groups[kv.gid] {
 				if i != kv.me {
-					args := &PingArgs{Me: kv.me, Num: latest.Num, Bid: bid}
+					args := &PingArgs{Me: kv.me, Num: latest.Num, Bid: bid, Done: false}
 					var reply PingReply
 					call(srv, "ShardKV.Ping", args, &reply)
 				}
@@ -555,7 +571,7 @@ func (kv *ShardKV) followerStartHandoff(latest *shardmaster.Config, bid int, lea
 
 	d := DeadPings*PingInterval + time.Duration(rand.Intn(100))*time.Millisecond
 
-	Trace.Printf("[%d] [%d] [Follower Start Handoff] - Num [%d] Bid [%d] Leader [%d] Timeout [%v]\n",
+	Info.Printf("[%d] [%d] [Follower Start Handoff] - Num [%d] Bid [%d] Leader [%d] Timeout [%v]\n",
 		kv.gid, kv.me, latest.Num, bid, leader, d)
 
 	timer := time.NewTimer(d)
@@ -566,6 +582,10 @@ loop:
 		case args := <-kv.ping:
 			if args.Me == leader && args.Num == latest.Num && args.Bid == bid {
 				timer.Reset(d)
+				if args.Done {
+					timer.Stop()
+					break loop
+				}
 			}
 		case <-timer.C:
 			timer.Stop()
@@ -610,19 +630,23 @@ func (kv *ShardKV) fetchShards(latest *shardmaster.Config, shardsToBeMoved []Sha
 			return
 		}
 
+		perm := rand.Perm(len(servers))
+
 		for {
-			for _, srv := range servers {
+			for _, srv := range perm {
 				args := &GetShardArgs{Shard: shard, Num: num}
 
 				var reply GetShardReply
-				ok := call(srv, "ShardKV.GetShard", args, &reply)
+				ok := call(servers[srv], "ShardKV.GetShard", args, &reply)
 				if ok && reply.Err == OK {
 					addToLocalStorage(&reply.Data)
 					return
+				} else {
+
 				}
 
 			}
-			time.Sleep(10 * time.Millisecond)
+			time.Sleep(100 * time.Millisecond)
 		}
 	}
 
@@ -647,7 +671,7 @@ func (kv *ShardKV) fetchShards(latest *shardmaster.Config, shardsToBeMoved []Sha
 
 	xid := hashConfigBid(&configBid)
 
-	Trace.Printf("[%d] [%d] *End Handoff* [%d] - Num [%d]\n", kv.gid, kv.me, xid, args.Id.Config.Num)
+	Info.Printf("[%d] [%d] \033[35m*End Handoff*\033[0m [%d] - Num [%d]\n", kv.gid, kv.me, xid, args.Id.Config.Num)
 
 	go kv.mustCommit(Op{Id: xid, Args: &args, Shard: shardmaster.NShards}, responseChan)
 
@@ -657,7 +681,7 @@ func (kv *ShardKV) fetchShards(latest *shardmaster.Config, shardsToBeMoved []Sha
 func (kv *ShardKV) endHandoff(i int, op Op) {
 	args := op.Args.(*EndHandoff)
 
-	Trace.Printf("[%d] [%d] [SM] [%d] - End Handoff Num [%d] Shards Moved [%d]\n",
+	Info.Printf("[%d] [%d] [SM] [%d] - \033[32mEnd Handoff\033[0m Num [%d] Shards Moved [%d]\n",
 		kv.gid, kv.me, i, args.Id.Config.Num, len(args.Shards))
 
 	metaTablet := kv.dataForShard[shardmaster.NShards]
@@ -678,6 +702,17 @@ func (kv *ShardKV) endHandoff(i int, op Op) {
 	metaTablet.active = true
 	metaTablet.Num = args.Id.Config.Num + 1
 
+	// Broadcast that we're done with this config-bid
+	go func() {
+		for i, srv := range args.Id.Config.Groups[kv.gid] {
+			if i != kv.me {
+				args := &PingArgs{Me: kv.me, Num: args.Id.Config.Num, Bid: args.Id.Bid - 1, Done: true}
+				var reply PingReply
+				call(srv, "ShardKV.Ping", args, &reply)
+			}
+		}
+	}()
+
 	kv.config = args.Id.Config
 }
 
@@ -690,7 +725,7 @@ func (kv *ShardKV) reconfigure(latest *shardmaster.Config, bid int) {
 
 	xid := hashConfigBid(&configBid)
 
-	Trace.Printf("[%d] [%d] *Start Handoff* [%d] - Num [%d] Bid [%d]\n",
+	Info.Printf("[%d] [%d] \033[35m*Start Handoff*\033[0m [%d] - Num [%d] Bid [%d]\n",
 		kv.gid, kv.me, xid, args.Id.Config.Num, args.Id.Bid)
 
 	go kv.mustCommit(Op{Id: xid, Args: &args, Shard: shardmaster.NShards}, responseChan)
@@ -747,7 +782,9 @@ func StartServer(gid int64, shardmasters []string,
 	gob.Register(&EndHandoff{})
 	gob.Register(&ShardData{})
 	gob.Register(&PutArgs{})
+	gob.Register(&PutReply{})
 	gob.Register(&GetArgs{})
+	gob.Register(&GetReply{})
 	gob.Register(&GetShardArgs{})
 	gob.Register(&PingArgs{})
 

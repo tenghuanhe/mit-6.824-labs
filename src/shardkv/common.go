@@ -59,9 +59,10 @@ const PingInterval = time.Millisecond * 100
 const DeadPings = 5
 
 type PingArgs struct {
-	Me  int
-	Num int
-	Bid int
+	Me   int
+	Num  int
+	Bid  int
+	Done bool
 }
 
 type PingReply struct {
@@ -76,6 +77,8 @@ func hash(s string) uint32 {
 func hashConfigBid(c *ConfigBid) int64 {
 	h := fnv.New64a()
 	encoder := gob.NewEncoder(h)
-	encoder.Encode(*c)
+	encoder.Encode(c.Config.Num)
+	encoder.Encode(c.Config.Shards)
+	encoder.Encode(c.Bid)
 	return int64(h.Sum64() >> 1)
 }
