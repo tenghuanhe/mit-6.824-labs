@@ -93,7 +93,7 @@ type ShardKV struct {
 func init() {
 	log.SetOutput(ioutil.Discard)
 	Trace = log.New(ioutil.Discard, "", log.Lmicroseconds)
-	Debug = log.New(os.Stdout, "", log.Lmicroseconds)
+	Debug = log.New(ioutil.Discard, "", log.Lmicroseconds)
 	Info = log.New(ioutil.Discard, "", log.Lmicroseconds)
 	rand.Seed(time.Now().UTC().UnixNano())
 }
@@ -445,7 +445,7 @@ func (kv *ShardKV) GetShard(args *GetShardArgs, reply *GetShardReply) error {
 		reply.Data = *tablet
 		reply.Err = OK
 
-		Debug.Printf("[%d] [%d] *GetShard* - Shard [%d] Num [%d] -> [%s]\n",
+		Trace.Printf("[%d] [%d] *GetShard* - Shard [%d] Num [%d] -> [%s]\n",
 			kv.gid, kv.me, args.Shard, args.Num, reply.Err)
 
 		return nil
@@ -453,7 +453,7 @@ func (kv *ShardKV) GetShard(args *GetShardArgs, reply *GetShardReply) error {
 
 	reply.Err = ErrNotFound
 
-	Debug.Printf("[%d] [%d] *GetShard* - Shard [%d] Num [%d] -> [%s]\n",
+	Trace.Printf("[%d] [%d] *GetShard* - Shard [%d] Num [%d] -> [%s]\n",
 		kv.gid, kv.me, args.Shard, args.Num, reply.Err)
 
 	return nil
@@ -469,8 +469,14 @@ func (kv *ShardKV) isHandoffRequired(latest *shardmaster.Config) (result []Shard
 
 	current := &kv.config
 
-	if current.Num == latest.Num {
+	if latest.Num == current.Num {
 		return
+	}
+
+	// should only happen on node bootstrap
+	if latest.Num > current.Num+1 {
+		kv.config = kv.sm.Query(latest.Num - 1)
+		current = &kv.config
 	}
 
 	for i := range current.Shards {
@@ -512,8 +518,10 @@ func (kv *ShardKV) startHandoff(i int, op Op) bool {
 		}
 	}
 
+	prev := kv.config
+
 	if kv.me == args.Leader {
-		go kv.leaderStartHandoff(&args.Id.Config, args.Id.Bid, shardsToBeMoved)
+		go kv.leaderStartHandoff(&args.Id.Config, &prev, args.Id.Bid, shardsToBeMoved)
 	} else {
 		go kv.followerStartHandoff(&args.Id.Config, args.Id.Bid, args.Leader)
 	}
@@ -521,7 +529,7 @@ func (kv *ShardKV) startHandoff(i int, op Op) bool {
 	return true
 }
 
-func (kv *ShardKV) leaderStartHandoff(latest *shardmaster.Config, bid int, shardsToBeMoved []ShardState) {
+func (kv *ShardKV) leaderStartHandoff(latest *shardmaster.Config, prev *shardmaster.Config, bid int, shardsToBeMoved []ShardState) {
 	Trace.Printf("[%d] [%d] [Leader Start Handoff] - Num [%d] Bid [%d] Shards Affected [%d]\n",
 		kv.gid, kv.me, latest.Num, bid, len(shardsToBeMoved))
 
@@ -540,7 +548,7 @@ func (kv *ShardKV) leaderStartHandoff(latest *shardmaster.Config, bid int, shard
 		}
 	}()
 
-	kv.fetchShards(latest, shardsToBeMoved, bid)
+	kv.fetchShards(latest, prev, shardsToBeMoved, bid)
 }
 
 func (kv *ShardKV) followerStartHandoff(latest *shardmaster.Config, bid int, leader int) {
@@ -581,11 +589,9 @@ loop:
 	kv.reconfigure(latest, bid+1)
 }
 
-func (kv *ShardKV) fetchShards(latest *shardmaster.Config, shardsToBeMoved []ShardState, bid int) {
+func (kv *ShardKV) fetchShards(latest *shardmaster.Config, prev *shardmaster.Config, shardsToBeMoved []ShardState, bid int) {
 	var l sync.Mutex
 	localStorage := make([]ShardData, 0)
-
-	current := &kv.config
 
 	done := make(chan struct{})
 
@@ -593,7 +599,7 @@ func (kv *ShardKV) fetchShards(latest *shardmaster.Config, shardsToBeMoved []Sha
 		Trace.Printf("[%d] [%d] [Fetch Shards] - Shard [%d] Num [%d] From GID [%d]\n",
 			kv.gid, kv.me, shard, num, gid)
 
-		servers := current.Groups[gid]
+		servers := prev.Groups[gid]
 
 		addToLocalStorage := func(shardData ShardData) {
 			l.Lock()
@@ -612,7 +618,9 @@ func (kv *ShardKV) fetchShards(latest *shardmaster.Config, shardsToBeMoved []Sha
 
 		perm := rand.Perm(len(servers))
 
-		for {
+		metaTablet := kv.dataForShard[shardmaster.NShards]
+
+		for !metaTablet.active {
 			for _, srv := range perm {
 				args := &GetShardArgs{Shard: shard, Num: num}
 
@@ -625,13 +633,15 @@ func (kv *ShardKV) fetchShards(latest *shardmaster.Config, shardsToBeMoved []Sha
 			}
 			time.Sleep(100 * time.Millisecond)
 		}
+
+		done <- struct{}{}
 	}
 
 	count := 0
 	for _, ss := range shardsToBeMoved {
 		if ss.State {
 			count++
-			go getShardsFromCurrentOwner(ss.Shard, latest.Num, current.Shards[ss.Shard])
+			go getShardsFromCurrentOwner(ss.Shard, latest.Num, prev.Shards[ss.Shard])
 		}
 	}
 
