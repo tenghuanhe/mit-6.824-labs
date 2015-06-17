@@ -15,19 +15,10 @@ import "shardmaster"
 import "strconv"
 import "io/ioutil"
 import "strings"
-import "reflect"
-
-const Debug = 0
-
-func DPrintf(format string, a ...interface{}) (n int, err error) {
-	if Debug > 0 {
-		log.Printf(format, a...)
-	}
-	return
-}
 
 var (
 	Trace *log.Logger
+	Debug *log.Logger
 	Info  *log.Logger
 )
 
@@ -43,11 +34,10 @@ type ExecuteRequest struct {
 }
 
 type RequestState struct {
-	Xid     int64
-	State   string
+	xid     int64
+	state   string
 	seq     int
 	waiting []chan interface{}
-	Resp    interface{}
 }
 
 type ConfigBid struct {
@@ -68,12 +58,11 @@ type EndHandoff struct {
 type Nop int
 
 type ShardData struct {
-	mu       sync.Mutex
-	active   bool
-	Id       int
-	Num      int
-	Data     map[string]string
-	Requests map[int64]*RequestState
+	mu     sync.Mutex
+	active bool
+	Id     int
+	Num    int
+	Data   map[string]string
 }
 
 type Op struct {
@@ -94,6 +83,7 @@ type ShardKV struct {
 	cond           *sync.Cond
 	dataForShard   [shardmaster.NShards + 1]*ShardData
 	config         shardmaster.Config
+	requests       map[int64]*RequestState
 	subscribe      chan ExecuteRequest
 	commitRequest  chan Op
 	commitResponse chan int
@@ -103,6 +93,7 @@ type ShardKV struct {
 func init() {
 	log.SetOutput(ioutil.Discard)
 	Trace = log.New(ioutil.Discard, "", log.Lmicroseconds)
+	Debug = log.New(os.Stdout, "", log.Lmicroseconds)
 	Info = log.New(ioutil.Discard, "", log.Lmicroseconds)
 	rand.Seed(time.Now().UTC().UnixNano())
 }
@@ -123,18 +114,16 @@ func (kv *ShardKV) isInstanceDecided(seq int) bool {
 	if decided {
 		dop := v.(Op)
 
-		tablet := kv.dataForShard[dop.Shard]
+		kv.mu.Lock()
+		defer kv.mu.Unlock()
 
-		tablet.mu.Lock()
-		defer tablet.mu.Unlock()
-
-		if reqState, ok := tablet.Requests[dop.Id]; ok {
-			reqState.State = Committed
+		if reqState, ok := kv.requests[dop.Id]; ok {
+			reqState.state = Committed
 			reqState.seq = seq
 		} else {
-			tablet.Requests[dop.Id] = &RequestState{
-				Xid:   dop.Id,
-				State: Committed,
+			kv.requests[dop.Id] = &RequestState{
+				xid:   dop.Id,
+				state: Committed,
 				seq:   seq,
 			}
 		}
@@ -159,35 +148,31 @@ func (kv *ShardKV) waitForCommit(seq int, op Op) {
 }
 
 func (kv *ShardKV) requestExists(op Op, responseChan chan interface{}) bool {
-	tablet := kv.dataForShard[op.Shard]
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
 
-	tablet.mu.Lock()
-	defer tablet.mu.Unlock()
+	if reqState, ok := kv.requests[op.Id]; ok {
+		Trace.Printf("[%d] [%d] [mustCommit] [%d] - Request exists with state [%s]\n", kv.gid, kv.me, op.Id, reqState.state)
 
-	if !(tablet.active || op.Shard == shardmaster.NShards) {
-		Trace.Printf("[%d] [%d] [mustCommit] [%d] - Shard [%d] Inactive\n", kv.gid, kv.me, op.Id, op.Shard)
-		responseChan <- getWrongGroupReply(op)
-		return true
-	}
-
-	if reqState, ok := tablet.Requests[op.Id]; ok {
-		Trace.Printf("[%d] [%d] [mustCommit] [%d] - Request exists with state [%s]\n", kv.gid, kv.me, op.Id, reqState.State)
-
-		if reqState.State != Executed {
+		if reqState.state != Executed {
 			reqState.waiting = append(reqState.waiting, responseChan)
+			if len(reqState.waiting) == 1 {
+				Trace.Printf("[%d] [%d] [mustCommit] [%d] - Empty waiting list with state [%s]\n", kv.gid, kv.me, op.Id, reqState.state)
+				return false
+			}
 			return true
 		}
 
-		responseChan <- reqState.Resp
+		kv.subscribe <- ExecuteRequest{seq: reqState.seq, responseChan: responseChan}
 
 		return true
 	}
 
 	Trace.Printf("[%d] [%d] [*mustCommit*] [%d] - New request\n", kv.gid, kv.me, op.Id)
 
-	tablet.Requests[op.Id] = &RequestState{
-		Xid:     op.Id,
-		State:   Active,
+	kv.requests[op.Id] = &RequestState{
+		xid:     op.Id,
+		state:   Active,
 		waiting: []chan interface{}{responseChan},
 	}
 
@@ -204,19 +189,16 @@ func (kv *ShardKV) mustCommit(op Op, responseChan chan interface{}) {
 	seq := <-kv.commitResponse
 
 	flushResponse := func(resp interface{}) {
-		tablet := kv.dataForShard[op.Shard]
+		kv.mu.Lock()
+		defer kv.mu.Unlock()
 
-		tablet.mu.Lock()
-		defer tablet.mu.Unlock()
+		reqState := kv.requests[op.Id]
 
-		for _, waitingRequest := range tablet.Requests[op.Id].waiting {
+		for _, waitingRequest := range kv.requests[op.Id].waiting {
 			waitingRequest <- resp
 		}
-	}
 
-	if seq == -2 {
-		flushResponse(getWrongGroupReply(op))
-		return
+		reqState.state = Executed
 	}
 
 	executeResponseChan := make(chan interface{})
@@ -229,19 +211,12 @@ func (kv *ShardKV) mustCommit(op Op, responseChan chan interface{}) {
 func (kv *ShardKV) commitRequests() {
 	var firstUnchosenIndex int
 
-	isRequestCommitted := func(num int, xid int64) int {
-		tablet := kv.dataForShard[num]
+	isRequestCommitted := func(xid int64) int {
+		kv.mu.Lock()
+		defer kv.mu.Unlock()
 
-		tablet.mu.Lock()
-		defer tablet.mu.Unlock()
-
-		if !(tablet.active || num == shardmaster.NShards) {
-			Trace.Printf("[%d] [%d] [CR] [%d] - Shard [%d] Inactive\n", kv.gid, kv.me, xid, num)
-			return -2
-		}
-
-		reqState, _ := tablet.Requests[xid]
-		if reqState.State == Committed {
+		reqState, _ := kv.requests[xid]
+		if reqState.state == Committed {
 			Trace.Printf("[%d] [%d] [CR] [%d] - Committed at [%d]\n", kv.gid, kv.me, xid, reqState.seq)
 			return reqState.seq
 		}
@@ -255,14 +230,14 @@ nextRequest:
 
 		Trace.Printf("[%d] [%d] [CR] - Received [%d]\n", kv.gid, kv.me, op.Id)
 
-		if seq := isRequestCommitted(op.Shard, op.Id); seq != -1 {
+		if seq := isRequestCommitted(op.Id); seq != -1 {
 			kv.commitResponse <- seq
 			continue nextRequest
 		}
 
 		for kv.isInstanceDecided(firstUnchosenIndex) {
 			firstUnchosenIndex++
-			if seq := isRequestCommitted(op.Shard, op.Id); seq != -1 {
+			if seq := isRequestCommitted(op.Id); seq != -1 {
 				kv.commitResponse <- seq
 				continue nextRequest
 			}
@@ -275,7 +250,7 @@ nextRequest:
 
 			firstUnchosenIndex++
 
-			if seq := isRequestCommitted(op.Shard, op.Id); seq != -1 {
+			if seq := isRequestCommitted(op.Id); seq != -1 {
 				kv.commitResponse <- seq
 				continue nextRequest
 			}
@@ -283,34 +258,18 @@ nextRequest:
 	}
 }
 
-type MapEntry struct {
-	num int
-	xid int64
-}
-
 func (kv *ShardKV) executeStateMachine() {
 	var i int // current position on log
 
-	log := make([]MapEntry, 0)
+	responses := make([]interface{}, 0)
 
 	for !kv.dead {
 		req := <-kv.subscribe
 		Trace.Printf("[%d] [%d] [SM] - Subscribe [%d]\n", kv.gid, kv.me, req.seq)
 
-		flushResponseForSeq := func(seq int) {
-			e := log[req.seq]
-
-			tablet := kv.dataForShard[e.num]
-
-			tablet.mu.Lock()
-			defer tablet.mu.Unlock()
-
-			req.responseChan <- tablet.Requests[e.xid].Resp
-		}
-
-		if req.seq < len(log) {
-			Trace.Printf("[%d] [%d] [SM] - Early Notify [%d]\n", kv.gid, kv.me, req.seq)
-			flushResponseForSeq(req.seq)
+		if req.seq < len(responses) {
+			Info.Printf("[%d] [%d] [SM] - Early Notify [%d]\n", kv.gid, kv.me, req.seq)
+			req.responseChan <- responses[req.seq]
 			continue
 		}
 
@@ -327,71 +286,69 @@ func (kv *ShardKV) executeStateMachine() {
 
 			switch op.Args.(type) {
 			case *PutArgs:
-				kv.put(i, op)
+				reply := kv.put(i, op)
+				responses = append(responses, reply)
 			case *GetArgs:
-				kv.get(i, op)
+				reply := kv.get(i, op)
+				responses = append(responses, reply)
 			case *StartHandoff:
-				kv.startHandoff(i, op)
+				reply := kv.startHandoff(i, op)
+				responses = append(responses, reply)
 			case *EndHandoff:
-				kv.endHandoff(i, op)
+				reply := kv.endHandoff(i, op)
+				responses = append(responses, reply)
 			}
-
-			log = append(log, MapEntry{op.Shard, op.Id})
 		}
 
 		Trace.Printf("[%d] [%d] [SM] - Notify [%d]\n", kv.gid, kv.me, req.seq)
 
-		flushResponseForSeq(len(log) - 1)
+		req.responseChan <- responses[len(responses)-1]
 	}
 }
 
 ///////////////////////////// Get, Put & PutHash ////////////////////////////////////////////////////////////
 
-func (kv *ShardKV) put(i int, op Op) {
+func (kv *ShardKV) put(i int, op Op) (reply PutReply) {
 	args := op.Args.(*PutArgs)
 	tablet := kv.dataForShard[op.Shard]
 
 	tablet.mu.Lock()
 	defer tablet.mu.Unlock()
 
-	var reply PutReply
 	if tablet.active {
 		reply = PutReply{PreviousValue: tablet.Data[args.Key]}
 		if args.DoHash {
 			tablet.Data[args.Key] = strconv.Itoa(int(hash(tablet.Data[args.Key] + args.Value)))
-			Trace.Printf("[%d] [%d] [SM] [%d] #[%d] - PutHash [%s] : [%s] -> [%s] -> [%s]\n",
-				kv.gid, kv.me, i, op.Shard, args.Key, args.Value, tablet.Data[args.Key], reply.PreviousValue)
+			Trace.Printf("[%d] [%d] [SM] [%d] [%d] #[%d] - PutHash [%s] : [%s] -> [%s] -> [%s]\n",
+				kv.gid, kv.me, op.Id, i, op.Shard, args.Key, args.Value, tablet.Data[args.Key], reply.PreviousValue)
 		} else {
 			tablet.Data[args.Key] = args.Value
-			Trace.Printf("[%d] [%d] [SM] [%d] #[%d] - Put [%s] : [%s]\n", kv.gid, kv.me, i, op.Shard, args.Key, args.Value)
+			Trace.Printf("[%d] [%d] [SM] [%d] [%d] #[%d] - Put [%s] : [%s]\n", kv.gid, kv.me, i, op.Id, op.Shard, args.Key, args.Value)
 		}
-		tablet.Requests[op.Id].State = Executed
 	} else {
-		Trace.Printf("[%d] [%d] [SM] [%d] #[%d] - Shard Inactive - Put [%s]\n", kv.gid, kv.me, i, op.Shard, args.Key)
+		Trace.Printf("[%d] [%d] [SM] [%d] [%d] #[%d] - Shard Inactive - Put [%s]\n", kv.gid, kv.me, op.Id, i, op.Shard, args.Key)
 		reply = getWrongGroupReply(op).(PutReply)
 	}
 
-	tablet.Requests[op.Id].Resp = reply
+	return
 }
 
-func (kv *ShardKV) get(i int, op Op) {
+func (kv *ShardKV) get(i int, op Op) (reply GetReply) {
 	args := op.Args.(*GetArgs)
 	tablet := kv.dataForShard[op.Shard]
 
 	tablet.mu.Lock()
 	defer tablet.mu.Unlock()
 
-	var reply GetReply
 	if tablet.active {
 		reply = GetReply{Value: tablet.Data[args.Key]}
-		Trace.Printf("[%d] [%d] [SM] [%d] #[%d] - Get [%s] -> [%s]\n", kv.gid, kv.me, i, op.Shard, args.Key, reply.Value)
-		tablet.Requests[op.Id].State = Executed
+		Trace.Printf("[%d] [%d] [SM] [%d] [%d] #[%d] - Get [%s] -> [%s]\n", kv.gid, kv.me, op.Id, i, op.Shard, args.Key, reply.Value)
 	} else {
-		Trace.Printf("[%d] [%d] [SM] [%d] #[%d] - Shard Inactive - Get [%s]\n", kv.gid, kv.me, i, op.Shard, args.Key)
+		Trace.Printf("[%d] [%d] [SM] [%d] [%d] #[%d] - Shard Inactive - Get [%s]\n", kv.gid, kv.me, op.Id, i, op.Shard, args.Key)
 		reply = getWrongGroupReply(op).(GetReply)
 	}
 
-	tablet.Requests[op.Id].Resp = reply
+	return
 }
 
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) error {
@@ -404,8 +361,6 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) error {
 	go kv.mustCommit(Op{Id: args.Xid, Args: args, Shard: shard}, responseChan)
 
 	resp := <-responseChan
-
-	Info.Printf("[%d] [%d] *Get* [%d] #[%d] - Done\n", kv.gid, kv.me, args.Xid, shard)
 
 	*reply = resp.(GetReply)
 
@@ -429,8 +384,6 @@ func (kv *ShardKV) Put(args *PutArgs, reply *PutReply) error {
 	responseChan := make(chan interface{})
 
 	go kv.mustCommit(Op{Id: args.Xid, Args: args, Shard: shard}, responseChan)
-
-	Info.Printf("[%d] [%d] *Put* [%d] #[%d] - Done\n", kv.gid, kv.me, args.Xid, shard)
 
 	resp := <-responseChan
 
@@ -492,13 +445,7 @@ func (kv *ShardKV) GetShard(args *GetShardArgs, reply *GetShardReply) error {
 		reply.Data = *tablet
 		reply.Err = OK
 
-		for i, r := range reply.Data.Requests {
-			if r.State != Executed {
-				delete(reply.Data.Requests, i)
-			}
-		}
-
-		Trace.Printf("[%d] [%d] *GetShard* - Shard [%d] Num [%d] -> [%s]\n",
+		Debug.Printf("[%d] [%d] *GetShard* - Shard [%d] Num [%d] -> [%s]\n",
 			kv.gid, kv.me, args.Shard, args.Num, reply.Err)
 
 		return nil
@@ -506,7 +453,7 @@ func (kv *ShardKV) GetShard(args *GetShardArgs, reply *GetShardReply) error {
 
 	reply.Err = ErrNotFound
 
-	Trace.Printf("[%d] [%d] *GetShard* - Shard [%d] Num [%d] -> [%s]\n",
+	Debug.Printf("[%d] [%d] *GetShard* - Shard [%d] Num [%d] -> [%s]\n",
 		kv.gid, kv.me, args.Shard, args.Num, reply.Err)
 
 	return nil
@@ -538,11 +485,11 @@ func (kv *ShardKV) isHandoffRequired(latest *shardmaster.Config) (result []Shard
 	return
 }
 
-func (kv *ShardKV) startHandoff(i int, op Op) {
+func (kv *ShardKV) startHandoff(i int, op Op) bool {
 	args := op.Args.(*StartHandoff)
 
-	Info.Printf("[%d] [%d] [SM] [%d] - \033[32mStart Handoff\033[0m Num [%d] Bid [%d] Leader [%d]\n",
-		kv.gid, kv.me, i, args.Id.Config.Num, args.Id.Bid, args.Leader)
+	Info.Printf("[%d] [%d] [SM] [%d] [%d] - \033[32mStart Handoff\033[0m Num [%d] Bid [%d] Leader [%d]\n",
+		kv.gid, kv.me, op.Id, i, args.Id.Config.Num, args.Id.Bid, args.Leader)
 
 	metaTablet := kv.dataForShard[shardmaster.NShards]
 
@@ -571,11 +518,11 @@ func (kv *ShardKV) startHandoff(i int, op Op) {
 		go kv.followerStartHandoff(&args.Id.Config, args.Id.Bid, args.Leader)
 	}
 
-	metaTablet.Requests[op.Id].State = Executed
+	return true
 }
 
 func (kv *ShardKV) leaderStartHandoff(latest *shardmaster.Config, bid int, shardsToBeMoved []ShardState) {
-	Info.Printf("[%d] [%d] [Leader Start Handoff] - Num [%d] Bid [%d] Shards Affected [%d]\n",
+	Trace.Printf("[%d] [%d] [Leader Start Handoff] - Num [%d] Bid [%d] Shards Affected [%d]\n",
 		kv.gid, kv.me, latest.Num, bid, len(shardsToBeMoved))
 
 	go func() {
@@ -601,7 +548,7 @@ func (kv *ShardKV) followerStartHandoff(latest *shardmaster.Config, bid int, lea
 
 	d := DeadPings*PingInterval + time.Duration(rand.Intn(100))*time.Millisecond
 
-	Info.Printf("[%d] [%d] [Follower Start Handoff] - Num [%d] Bid [%d] Leader [%d] Timeout [%v]\n",
+	Trace.Printf("[%d] [%d] [Follower Start Handoff] - Num [%d] Bid [%d] Leader [%d] Timeout [%v]\n",
 		kv.gid, kv.me, latest.Num, bid, leader, d)
 
 	timer := time.NewTimer(d)
@@ -657,9 +604,8 @@ func (kv *ShardKV) fetchShards(latest *shardmaster.Config, shardsToBeMoved []Sha
 
 		if len(servers) == 0 {
 			addToLocalStorage(ShardData{
-				Id:       shard,
-				Data:     make(map[string]string),
-				Requests: make(map[int64]*RequestState),
+				Id:   shard,
+				Data: make(map[string]string),
 			})
 			return
 		}
@@ -709,39 +655,11 @@ func (kv *ShardKV) fetchShards(latest *shardmaster.Config, shardsToBeMoved []Sha
 	<-responseChan
 }
 
-func (kv *ShardKV) verifyTablet(tablet *ShardData) {
-	if tablet.Data == nil {
-		panic(fmt.Sprintf("[%d] [%d] [verifyTablet] #[%d]- Data is nil.\n", kv.gid, kv.me, tablet.Id))
-	}
-
-	Trace.Printf("[%d] [%d] [verifyTablet] #[%d]- Data Len [%d]\n", kv.gid, kv.me, tablet.Id, len(tablet.Data))
-
-	if tablet.Requests == nil {
-		panic(fmt.Sprintf("[%d] [%d] [verifyTablet] #[%d]- Requests is nil.\n", kv.gid, kv.me, tablet.Id))
-	}
-
-	Trace.Printf("[%d] [%d] [verifyTablet] #[%d]- Requests Len [%d]\n", kv.gid, kv.me, tablet.Id, len(tablet.Requests))
-
-	for _, reqState := range tablet.Requests {
-		if reqState.Xid == 0 {
-			panic(fmt.Sprintf("[%d] [%d] [verifyTablet] #[%d]- Xid is zero.\n", kv.gid, kv.me, tablet.Id))
-		}
-
-		if reqState.State != Executed {
-			panic(fmt.Sprintf("[%d] [%d] [verifyTablet] #[%d]- Request Xid [%d] Seq [%d] Waiting [%v] State [%s] is not Executed.\n",
-				kv.gid, kv.me, tablet.Id, reqState.Xid, reqState.seq, reqState.waiting, reqState.State))
-		}
-
-		Trace.Printf("[%d] [%d] [verifyTablet] #[%d]- Xid [%d] State [%s] Seq [%d] Waiting [%v] Response Type [%v]\n",
-			kv.gid, kv.me, tablet.Id, reqState.Xid, reqState.State, reqState.seq, reqState.waiting, reflect.TypeOf(reqState.Resp))
-	}
-}
-
-func (kv *ShardKV) endHandoff(i int, op Op) {
+func (kv *ShardKV) endHandoff(i int, op Op) bool {
 	args := op.Args.(*EndHandoff)
 
-	Info.Printf("[%d] [%d] [SM] [%d] - \033[32mEnd Handoff\033[0m Num [%d] Shards Moved [%d]\n",
-		kv.gid, kv.me, i, args.Id.Config.Num, len(args.Shards))
+	Info.Printf("[%d] [%d] [SM] [%d] [%d] - \033[32mEnd Handoff\033[0m Num [%d] Shards Moved [%d]\n",
+		kv.gid, kv.me, op.Id, i, args.Id.Config.Num, len(args.Shards))
 
 	metaTablet := kv.dataForShard[shardmaster.NShards]
 
@@ -757,12 +675,6 @@ func (kv *ShardKV) endHandoff(i int, op Op) {
 		for k, v := range shardData.Data {
 			tablet.Data[k] = v
 		}
-		tablet.Requests = make(map[int64]*RequestState)
-		for k, pv := range shardData.Requests {
-			v := *pv
-			tablet.Requests[k] = &v
-		}
-		kv.verifyTablet(tablet)
 		tablet.mu.Unlock()
 	}
 
@@ -782,7 +694,7 @@ func (kv *ShardKV) endHandoff(i int, op Op) {
 
 	kv.config = args.Id.Config
 
-	metaTablet.Requests[op.Id].State = Executed
+	return true
 }
 
 func (kv *ShardKV) reconfigure(latest *shardmaster.Config, bid int) {
@@ -845,15 +757,12 @@ func (kv *ShardKV) kill() {
 func StartServer(gid int64, shardmasters []string,
 	servers []string, me int) *ShardKV {
 	gob.Register(Op{})
-	gob.Register(&RequestState{})
 	gob.Register(&ConfigBid{})
 	gob.Register(&StartHandoff{})
 	gob.Register(&EndHandoff{})
 	gob.Register(&ShardData{})
 	gob.Register(&PutArgs{})
-	gob.Register(PutReply{})
 	gob.Register(&GetArgs{})
-	gob.Register(GetReply{})
 	gob.Register(&GetShardArgs{})
 	gob.Register(&PingArgs{})
 
@@ -864,9 +773,8 @@ func StartServer(gid int64, shardmasters []string,
 
 	for i := range kv.dataForShard {
 		kv.dataForShard[i] = &ShardData{
-			Id:       i,
-			Data:     make(map[string]string),
-			Requests: make(map[int64]*RequestState),
+			Id:   i,
+			Data: make(map[string]string),
 		}
 	}
 
@@ -874,6 +782,8 @@ func StartServer(gid int64, shardmasters []string,
 
 	kv.dataForShard[shardmaster.NShards].active = true
 	kv.dataForShard[shardmaster.NShards].Num = -1
+
+	kv.requests = make(map[int64]*RequestState)
 
 	kv.subscribe = make(chan ExecuteRequest)
 	kv.commitRequest = make(chan Op)

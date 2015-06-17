@@ -85,9 +85,12 @@ func (ck *Clerk) Get(key string) string {
 	ck.mu.Lock()
 	defer ck.mu.Unlock()
 
-	xid := nrand()
-
 	for {
+		xid := nrand()
+
+		// ask master for a new configuration.
+		ck.config = ck.sm.Query(-1)
+
 		shard := key2shard(key)
 
 		gid := ck.config.Shards[shard]
@@ -96,25 +99,26 @@ func (ck *Clerk) Get(key string) string {
 
 		if ok {
 			// try each server in the shard's replication group.
-			for _, srv := range servers {
-				args := &GetArgs{}
-				args.Xid = xid
-				args.Key = key
-				var reply GetReply
-				ok := call(srv, "ShardKV.Get", args, &reply)
-				if ok && (reply.Err == OK || reply.Err == ErrNoKey) {
-					return reply.Value
-				}
-				if ok && (reply.Err == ErrWrongGroup) {
-					break
+			// until successful reply or ErrWrongGroup
+		loop:
+			for {
+				for _, srv := range servers {
+					args := &GetArgs{}
+					args.Xid = xid
+					args.Key = key
+					var reply GetReply
+					ok := call(srv, "ShardKV.Get", args, &reply)
+					if ok && (reply.Err == OK || reply.Err == ErrNoKey) {
+						return reply.Value
+					}
+					if ok && (reply.Err == ErrWrongGroup) {
+						break loop
+					}
 				}
 			}
 		}
 
 		time.Sleep(100 * time.Millisecond)
-
-		// ask master for a new configuration.
-		ck.config = ck.sm.Query(-1)
 	}
 	return ""
 }
@@ -123,9 +127,12 @@ func (ck *Clerk) PutExt(key string, value string, dohash bool) string {
 	ck.mu.Lock()
 	defer ck.mu.Unlock()
 
-	xid := nrand()
-
 	for {
+		xid := nrand()
+
+		// ask master for a new configuration.
+		ck.config = ck.sm.Query(-1)
+
 		shard := key2shard(key)
 
 		gid := ck.config.Shards[shard]
@@ -134,27 +141,28 @@ func (ck *Clerk) PutExt(key string, value string, dohash bool) string {
 
 		if ok {
 			// try each server in the shard's replication group.
-			for _, srv := range servers {
-				args := &PutArgs{}
-				args.Xid = xid
-				args.Key = key
-				args.Value = value
-				args.DoHash = dohash
-				var reply PutReply
-				ok := call(srv, "ShardKV.Put", args, &reply)
-				if ok && reply.Err == OK {
-					return reply.PreviousValue
-				}
-				if ok && (reply.Err == ErrWrongGroup) {
-					break
+			// until successful reply or ErrWrongGroup
+		loop:
+			for {
+				for _, srv := range servers {
+					args := &PutArgs{}
+					args.Xid = xid
+					args.Key = key
+					args.Value = value
+					args.DoHash = dohash
+					var reply PutReply
+					ok := call(srv, "ShardKV.Put", args, &reply)
+					if ok && reply.Err == OK {
+						return reply.PreviousValue
+					}
+					if ok && (reply.Err == ErrWrongGroup) {
+						break loop
+					}
 				}
 			}
 		}
 
 		time.Sleep(100 * time.Millisecond)
-
-		// ask master for a new configuration.
-		ck.config = ck.sm.Query(-1)
 	}
 }
 
