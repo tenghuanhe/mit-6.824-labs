@@ -593,6 +593,8 @@ func (kv *ShardKV) fetchShards(latest *shardmaster.Config, prev *shardmaster.Con
 	var l sync.Mutex
 	localStorage := make([]ShardData, 0)
 
+	metaTablet := kv.dataForShard[shardmaster.NShards]
+
 	done := make(chan struct{})
 
 	getShardsFromCurrentOwner := func(shard int, num int, gid int64) {
@@ -617,8 +619,6 @@ func (kv *ShardKV) fetchShards(latest *shardmaster.Config, prev *shardmaster.Con
 		}
 
 		perm := rand.Perm(len(servers))
-
-		metaTablet := kv.dataForShard[shardmaster.NShards]
 
 		for !metaTablet.active {
 			for _, srv := range perm {
@@ -648,6 +648,14 @@ func (kv *ShardKV) fetchShards(latest *shardmaster.Config, prev *shardmaster.Con
 	for count > 0 {
 		<-done
 		count--
+	}
+
+	metaTablet.mu.Lock()
+	active := metaTablet.active
+	metaTablet.mu.Unlock()
+
+	if active {
+		return
 	}
 
 	responseChan := make(chan interface{})

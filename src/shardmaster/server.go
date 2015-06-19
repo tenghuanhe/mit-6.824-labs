@@ -273,6 +273,9 @@ func (sm *ShardMaster) join(args *JoinArgs) {
 	}
 
 	sm.configs = append(sm.configs, newConfig)
+
+	Info.Printf("[%d] [SM] *Join* - GID [%d] Num \033[1m\033[31m[%d]\033[0m Config [%v]\n",
+		sm.me, args.GID, newConfig.Num, newConfig.Shards)
 }
 
 func (sm *ShardMaster) leave(args *LeaveArgs) {
@@ -293,6 +296,9 @@ func (sm *ShardMaster) leave(args *LeaveArgs) {
 	}
 
 	sm.configs = append(sm.configs, newConfig)
+
+	Info.Printf("[%d] [SM] *Leave* - GID [%d] Num \033[1m\033[31m[%d]\033[0m Config [%v]\n",
+		sm.me, args.GID, newConfig.Num, newConfig.Shards)
 }
 
 func (sm *ShardMaster) move(args *MoveArgs) {
@@ -311,6 +317,9 @@ func (sm *ShardMaster) move(args *MoveArgs) {
 	}
 
 	sm.configs = append(sm.configs, newConfig)
+
+	Info.Printf("[%d] [SM] *Move* - Shard [%d] -> GID [%d] Num \033[1m\033[31m[%d]\033[0m Config [%v]\n",
+		sm.me, args.Shard, args.GID, newConfig.Num, newConfig.Shards)
 }
 
 func (sm *ShardMaster) executeStateMachine() {
@@ -353,7 +362,11 @@ func (sm *ShardMaster) executeStateMachine() {
 		}
 
 		Trace.Printf("[%d] [SM] - Notify Num: [%d] at Seq:[%d]\n", sm.me, req.num, req.seq)
-		req.responseChan <- sm.configs[len(sm.configs)-1]
+		if req.num >= 0 && req.num < len(sm.configs) {
+			req.responseChan <- sm.configs[req.num]
+		} else {
+			req.responseChan <- sm.configs[len(sm.configs)-1]
+		}
 	}
 }
 
